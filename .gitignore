@@ -1,0 +1,4 @@
+*.log
+*.tmp
+BossToolLog.txt
+BossACLFix_Log.txt
