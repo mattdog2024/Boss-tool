@@ -1,0 +1,75 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-i686-gcc
+
+      - name: Build binaries
+        shell: msys2 {0}
+        run: |
+          /mingw64/bin/x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool.exe main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
+          /mingw32/bin/i686-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool_x86.exe main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
+          /mingw64/bin/x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o FixACLUltimate.exe fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+          /mingw32/bin/i686-w64-mingw32-gcc -O2 -municode -mwindows -o FixACLUltimate_x86.exe fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+
+      - name: Prepare release files
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item BossTool.exe dist\BossTool.exe
+          Copy-Item BossTool_x86.exe dist\BossTool_x86.exe
+          Copy-Item FixACLUltimate.exe dist\FixACLUltimate.exe
+          Copy-Item FixACLUltimate_x86.exe dist\FixACLUltimate_x86.exe
+          Copy-Item README.md dist\README.md
+          Compress-Archive -Path dist\* -DestinationPath BossTool-${{ github.ref_name }}-windows.zip -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BossTool-${{ github.ref_name }}-windows
+          path: |
+            BossTool.exe
+            BossTool_x86.exe
+            FixACLUltimate.exe
+            FixACLUltimate_x86.exe
+            BossTool-${{ github.ref_name }}-windows.zip
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BossTool ${{ github.ref_name }}
+          body: |
+            Fixes long-running network resets that could lead to ERR_NO_BUFFER_SPACE.
+
+            Changes:
+            - Check whether the target IP exists on the adapter instead of comparing only the first returned IP.
+            - Add a network-change lock so multiple threads do not change the adapter at the same time.
+            - Close thread handles after creating background threads to reduce long-running resource use.
+          files: |
+            BossTool.exe
+            BossTool_x86.exe
+            FixACLUltimate.exe
+            FixACLUltimate_x86.exe
+            BossTool-${{ github.ref_name }}-windows.zip

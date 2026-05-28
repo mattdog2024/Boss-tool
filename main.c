@@ -103,6 +103,7 @@ static HANDLE    g_hMutex       = NULL;
 /* 状态标志 */
 static volatile BOOL g_bBossMode = FALSE;   /* 是否处于老板模式 */
 static volatile BOOL g_bLocked   = FALSE;   /* 是否处于锁屏状态 */
+static volatile LONG g_lNetworkChangeBusy = 0;
 /* 注意：不再保存登录状态，每次呼出设置都需要密码 */
 
 /* 配置 */
@@ -149,6 +150,7 @@ DWORD WINAPI     WatchdogThread(LPVOID);
 DWORD WINAPI     GuardThread(LPVOID);
 DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
+DWORD WINAPI     InitialIPThread(LPVOID);
 
 static void DoLockScreen(void);
 static void DoUnlockScreen(void);
@@ -162,6 +164,9 @@ static DWORD RunNetshDirect(const WCHAR *args);
 static const WCHAR* GetAdapterName(void);
 static void RandomizeMac(void);
 static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
+static BOOL BeginNetworkChange(void);
+static void EndNetworkChange(void);
+static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
 
 /* ============================================================
    工具：后台无窗口执行命令
@@ -270,6 +275,24 @@ static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+}
+
+static BOOL BeginNetworkChange(void) {
+    for (int i = 0; i < 240; i++) {
+        if (InterlockedCompareExchange(&g_lNetworkChangeBusy, 1, 0) == 0)
+            return TRUE;
+        Sleep(500);
+    }
+    return FALSE;
+}
+
+static void EndNetworkChange(void) {
+    InterlockedExchange(&g_lNetworkChangeBusy, 0);
+}
+
+static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param) {
+    HANDLE hThread = CreateThread(NULL, 0, proc, param, 0, NULL);
+    if (hThread) CloseHandle(hThread);
 }
 
 /* ============================================================
@@ -978,23 +1001,31 @@ static volatile BOOL g_bAllowIPChange = FALSE;
 /* 当前应该保持的IP（用于守护线程比对） */
 static WCHAR g_szExpectedIP[64] = {0};
 
-/* 用 GetAdaptersInfo 读取当前实际IP（不读注册表，不触发事件） */
-static BOOL GetActualIP(WCHAR *outIP, int sz) {
+/* 遍历所有以太网/WiFi地址，确认目标IP是否真的存在 */
+static BOOL AdapterHasIP(const WCHAR *expectedIP) {
     ULONG bufLen = 16384;
     PIP_ADAPTER_INFO pInfo = (PIP_ADAPTER_INFO)malloc(bufLen);
     if (!pInfo) return FALSE;
     BOOL found = FALSE;
+
+    char expectedA[64] = {0};
+    WideCharToMultiByte(CP_ACP, 0, expectedIP, -1, expectedA, 63, NULL, NULL);
+
     if (GetAdaptersInfo(pInfo, &bufLen) == NO_ERROR) {
         PIP_ADAPTER_INFO p = pInfo;
         while (p && !found) {
             /* 只看以太网和WiFi */
             if (p->Type == MIB_IF_TYPE_ETHERNET ||
                 p->Type == IF_TYPE_IEEE80211) {
-                const char *ip = p->IpAddressList.IpAddress.String;
-                /* 跳过 0.0.0.0 */
-                if (ip[0] && strcmp(ip, "0.0.0.0") != 0) {
-                    MultiByteToWideChar(CP_ACP, 0, ip, -1, outIP, sz);
-                    found = TRUE;
+                IP_ADDR_STRING *addr = &p->IpAddressList;
+                while (addr) {
+                    const char *ip = addr->IpAddress.String;
+                    if (ip[0] && strcmp(ip, "0.0.0.0") != 0 &&
+                        strcmp(ip, expectedA) == 0) {
+                        found = TRUE;
+                        break;
+                    }
+                    addr = addr->Next;
                 }
             }
             p = p->Next;
@@ -1047,10 +1078,12 @@ DWORD WINAPI IPGuardThread(LPVOID p) {
         Sleep(5000);
         /* 开关关闭或允许修改时不守护 */
         if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
-        WCHAR szActual[64] = {0};
-        if (!GetActualIP(szActual, 64)) continue;
-        /* 比对实际IP与期望IP */
-        if (wcsncmp(szActual, g_szExpectedIP, 63) != 0) {
+        if (g_lNetworkChangeBusy) continue;
+        /* 目标IP不存在时，才恢复，避免多IP顺序变化导致反复重置网络 */
+        if (!AdapterHasIP(g_szExpectedIP)) {
+            Sleep(15000);
+            if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
+            if (g_lNetworkChangeBusy || AdapterHasIP(g_szExpectedIP)) continue;
             /* IP被改了，恢复 */
             if (g_bBossMode) {
                 ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
@@ -1117,6 +1150,7 @@ static void CloseNotepad(void) {
 }
 
 static void SetIPWork(void) {
+    if (!BeginNetworkChange()) return;
     /* 切换前先随机更换MAC地址 */
     RandomizeMac();
     wcsncpy(g_szExpectedIP, IP_WORK1, 63);
@@ -1125,9 +1159,11 @@ static void SetIPWork(void) {
     LockIPReg();
     /* 切换刲0.*后关闭记事本 */
     CloseNotepad();
+    EndNetworkChange();
 }
 
 static void SetIPBoss(void) {
+    if (!BeginNetworkChange()) return;
     /* 切换前先随机更换MAC地址 */
     RandomizeMac();
     wcsncpy(g_szExpectedIP, IP_BOSS, 63);
@@ -1136,6 +1172,7 @@ static void SetIPBoss(void) {
     LockIPReg();
     /* 切换到8.*后打开记事本 */
     OpenNotepad();
+    EndNetworkChange();
 }
 
 /* ============================================================
@@ -1464,13 +1501,19 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
     return 0;
 }
 
+DWORD WINAPI InitialIPThread(LPVOID pParam) {
+    (void)pParam;
+    SetIPWork();
+    return 0;
+}
+
 static void DoBossKey(void) {
     if (!g_bBossMode) {
         g_bBossMode = TRUE;
-        CreateThread(NULL, 0, BossKeyThread, (LPVOID)(ULONG_PTR)TRUE, 0, NULL);
+        StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)TRUE);
     } else {
         g_bBossMode = FALSE;
-        CreateThread(NULL, 0, BossKeyThread, (LPVOID)(ULONG_PTR)FALSE, 0, NULL);
+        StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)FALSE);
     }
 }
 
@@ -2296,9 +2339,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     ProtectProcess();
 
     /* 启动守护线程 */
-    CreateThread(NULL,0,WatchdogThread,NULL,0,NULL);
-    CreateThread(NULL,0,GuardThread,NULL,0,NULL);
-    CreateThread(NULL,0,IPGuardThread,NULL,0,NULL);
+    StartDetachedThread(WatchdogThread, NULL);
+    StartDetachedThread(GuardThread, NULL);
+    StartDetachedThread(IPGuardThread, NULL);
 
     /* 注册主窗口 */
     WNDCLASSW wc={0};
@@ -2324,7 +2367,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     /* 启动时强制设置工作IP（异步执行，不阻塞主线程）
      * 不管关机前是什么IP，开机一律恢复为20.*工作IP
      */
-    CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)SetIPWork, NULL, 0, NULL);
+    StartDetachedThread(InitialIPThread, NULL);
 
     /* 判断是否是开机自启动（命令行参数包含 /autostart） */
     BOOL bAutoStart = (wcsstr(lpCmdLine, L"/autostart") != NULL);
