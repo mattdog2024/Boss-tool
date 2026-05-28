@@ -13,6 +13,21 @@ jobs:
   build:
     runs-on: windows-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            msystem: UCRT64
+            packages: mingw-w64-ucrt-x86_64-gcc
+            boss_exe: BossTool.exe
+            acl_exe: FixACLUltimate.exe
+          - arch: x86
+            msystem: MINGW32
+            packages: mingw-w64-i686-gcc
+            boss_exe: BossTool_x86.exe
+            acl_exe: FixACLUltimate_x86.exe
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,40 +35,51 @@ jobs:
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
+          msystem: ${{ matrix.msystem }}
           update: true
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-i686-gcc
+          install: ${{ matrix.packages }}
 
-      - name: Build binaries
+      - name: Build ${{ matrix.arch }} binaries
         shell: msys2 {0}
         run: |
-          /mingw64/bin/x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool.exe main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
-          /mingw32/bin/i686-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool_x86.exe main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
-          /mingw64/bin/x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o FixACLUltimate.exe fix_acl_ultimate.c -ladvapi32 -lshell32 -static
-          /mingw32/bin/i686-w64-mingw32-gcc -O2 -municode -mwindows -o FixACLUltimate_x86.exe fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.acl_exe }}" fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+
+      - name: Upload ${{ matrix.arch }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BossTool-${{ github.ref_name }}-${{ matrix.arch }}
+          path: |
+            ${{ matrix.boss_exe }}
+            ${{ matrix.acl_exe }}
+
+  release:
+    runs-on: windows-latest
+    needs: build
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Prepare release files
         shell: powershell
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item BossTool.exe dist\BossTool.exe
-          Copy-Item BossTool_x86.exe dist\BossTool_x86.exe
-          Copy-Item FixACLUltimate.exe dist\FixACLUltimate.exe
-          Copy-Item FixACLUltimate_x86.exe dist\FixACLUltimate_x86.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x64\BossTool.exe dist\BossTool.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x64\FixACLUltimate.exe dist\FixACLUltimate.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x86\BossTool_x86.exe dist\BossTool_x86.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x86\FixACLUltimate_x86.exe dist\FixACLUltimate_x86.exe
           Copy-Item README.md dist\README.md
           Compress-Archive -Path dist\* -DestinationPath BossTool-${{ github.ref_name }}-windows.zip -Force
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: BossTool-${{ github.ref_name }}-windows
-          path: |
-            BossTool.exe
-            BossTool_x86.exe
-            FixACLUltimate.exe
-            FixACLUltimate_x86.exe
-            BossTool-${{ github.ref_name }}-windows.zip
+          Copy-Item dist\BossTool.exe BossTool.exe
+          Copy-Item dist\BossTool_x86.exe BossTool_x86.exe
+          Copy-Item dist\FixACLUltimate.exe FixACLUltimate.exe
+          Copy-Item dist\FixACLUltimate_x86.exe FixACLUltimate_x86.exe
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
