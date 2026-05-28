@@ -22,11 +22,13 @@ jobs:
             packages: mingw-w64-ucrt-x86_64-gcc
             boss_exe: BossTool.exe
             acl_exe: FixACLUltimate.exe
+            killer_exe: BossToolKiller.exe
           - arch: x86
             msystem: MINGW32
             packages: mingw-w64-i686-gcc
             boss_exe: BossTool_x86.exe
             acl_exe: FixACLUltimate_x86.exe
+            killer_exe: BossToolKiller_x86.exe
 
     steps:
       - name: Checkout
@@ -44,6 +46,7 @@ jobs:
         run: |
           gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
           gcc -O2 -municode -mwindows -o "${{ matrix.acl_exe }}" fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.killer_exe }}" BossToolKiller.c -ladvapi32 -lshell32 -static
 
       - name: Upload ${{ matrix.arch }} artifact
         uses: actions/upload-artifact@v4
@@ -52,6 +55,7 @@ jobs:
           path: |
             ${{ matrix.boss_exe }}
             ${{ matrix.acl_exe }}
+            ${{ matrix.killer_exe }}
 
   release:
     runs-on: windows-latest
@@ -72,14 +76,18 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item artifacts\BossTool-${{ github.ref_name }}-x64\BossTool.exe dist\BossTool.exe
           Copy-Item artifacts\BossTool-${{ github.ref_name }}-x64\FixACLUltimate.exe dist\FixACLUltimate.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x64\BossToolKiller.exe dist\BossToolKiller.exe
           Copy-Item artifacts\BossTool-${{ github.ref_name }}-x86\BossTool_x86.exe dist\BossTool_x86.exe
           Copy-Item artifacts\BossTool-${{ github.ref_name }}-x86\FixACLUltimate_x86.exe dist\FixACLUltimate_x86.exe
+          Copy-Item artifacts\BossTool-${{ github.ref_name }}-x86\BossToolKiller_x86.exe dist\BossToolKiller_x86.exe
           Copy-Item README.md dist\README.md
           Compress-Archive -Path dist\* -DestinationPath BossTool-${{ github.ref_name }}-windows.zip -Force
           Copy-Item dist\BossTool.exe BossTool.exe
           Copy-Item dist\BossTool_x86.exe BossTool_x86.exe
           Copy-Item dist\FixACLUltimate.exe FixACLUltimate.exe
           Copy-Item dist\FixACLUltimate_x86.exe FixACLUltimate_x86.exe
+          Copy-Item dist\BossToolKiller.exe BossToolKiller.exe
+          Copy-Item dist\BossToolKiller_x86.exe BossToolKiller_x86.exe
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
@@ -93,9 +101,12 @@ jobs:
             - Check whether the target IP exists on the adapter instead of comparing only the first returned IP.
             - Add a network-change lock so multiple threads do not change the adapter at the same time.
             - Close thread handles after creating background threads to reduce long-running resource use.
+            - Add BossToolKiller.exe for emergency exit. Run it as administrator to force close old BossTool processes before starting the new version.
           files: |
             BossTool.exe
             BossTool_x86.exe
             FixACLUltimate.exe
             FixACLUltimate_x86.exe
+            BossToolKiller.exe
+            BossToolKiller_x86.exe
             BossTool-${{ github.ref_name }}-windows.zip
