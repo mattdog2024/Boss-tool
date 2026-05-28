@@ -19,6 +19,11 @@
 #include <shellapi.h>
 #include <wchar.h>
 
+#define MAX_TARGET_PIDS 256
+
+static DWORD g_targetPids[MAX_TARGET_PIDS];
+static int g_targetPidCount = 0;
+
 static BOOL IsElevated(void) {
     BOOL elevated = FALSE;
     HANDLE token = NULL;
@@ -51,11 +56,42 @@ static BOOL IsBossToolProcess(const WCHAR *name) {
            _wcsicmp(name, L"BossTool_x86.exe") == 0;
 }
 
-static int KillBossToolProcesses(void) {
-    int killed = 0;
-    DWORD selfPid = GetCurrentProcessId();
+static BOOL IsKnownBossWindow(const WCHAR *className, const WCHAR *title) {
+    if (wcsncmp(className, L"BossTool", 8) == 0) return TRUE;
+    if (wcscmp(title, L"\x7CFB\x7EDF\x8BBE\x7F6E") == 0) return TRUE;
+    return FALSE;
+}
+
+static void AddTargetPid(DWORD pid) {
+    if (!pid || pid == GetCurrentProcessId()) return;
+    for (int i = 0; i < g_targetPidCount; i++) {
+        if (g_targetPids[i] == pid) return;
+    }
+    if (g_targetPidCount < MAX_TARGET_PIDS) {
+        g_targetPids[g_targetPidCount++] = pid;
+    }
+}
+
+static BOOL CALLBACK EnumWindowsProc(HWND hWnd, LPARAM lParam) {
+    (void)lParam;
+    WCHAR className[256] = {0};
+    WCHAR title[512] = {0};
+    DWORD pid = 0;
+
+    GetClassNameW(hWnd, className, 255);
+    GetWindowTextW(hWnd, title, 511);
+    GetWindowThreadProcessId(hWnd, &pid);
+
+    if (IsKnownBossWindow(className, title)) {
+        AddTargetPid(pid);
+    }
+
+    return TRUE;
+}
+
+static BOOL CollectBossToolProcessesByName(void) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return -1;
+    if (snap == INVALID_HANDLE_VALUE) return FALSE;
 
     PROCESSENTRY32W pe;
     ZeroMemory(&pe, sizeof(pe));
@@ -63,27 +99,41 @@ static int KillBossToolProcesses(void) {
 
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (pe.th32ProcessID == selfPid) continue;
-            if (!IsBossToolProcess(pe.szExeFile)) continue;
-
-            HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE,
-                                      FALSE, pe.th32ProcessID);
-            if (!proc) {
-                proc = OpenProcess(PROCESS_TERMINATE,
-                                   FALSE, pe.th32ProcessID);
-            }
-            if (proc) {
-                if (TerminateProcess(proc, 1)) {
-                    WaitForSingleObject(proc, 3000);
-                    killed++;
-                }
-                CloseHandle(proc);
+            if (IsBossToolProcess(pe.szExeFile)) {
+                AddTargetPid(pe.th32ProcessID);
             }
         } while (Process32NextW(snap, &pe));
     }
 
     CloseHandle(snap);
+    return TRUE;
+}
+
+static int KillCollectedProcesses(void) {
+    int killed = 0;
+    for (int i = 0; i < g_targetPidCount; i++) {
+        HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE,
+                                  FALSE, g_targetPids[i]);
+        if (!proc) {
+            proc = OpenProcess(PROCESS_TERMINATE, FALSE, g_targetPids[i]);
+        }
+        if (proc) {
+            if (TerminateProcess(proc, 1)) {
+                WaitForSingleObject(proc, 3000);
+                killed++;
+            }
+            CloseHandle(proc);
+        }
+    }
     return killed;
+}
+
+static int KillBossToolProcesses(void) {
+    g_targetPidCount = 0;
+    BOOL byNameOK = CollectBossToolProcessesByName();
+    EnumWindows(EnumWindowsProc, 0);
+    if (!byNameOK && g_targetPidCount == 0) return -1;
+    return KillCollectedProcesses();
 }
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
