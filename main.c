@@ -1,10 +1,15 @@
 /*
- * BossTool v3.0 - Windows 7/8/10/11 隐形管理工具（修复版）
+ * BossTool v3.1 - Windows 7/8/10/11 隐形管理工具
  *
- * 修复内容：
- * 1. 隐藏程序支持中文窗口标题（枚举所有窗口匹配标题）
+ * v3.1 修复：
+ * 1. 修复长期使用后出现 ERR_NO_BUFFER_SPACE 导致网络不可用的问题
+ *    - 把 TcpTimedWaitDelay 从 240秒改为 30秒（TIME_WAIT僵尸连接释放快8倍）
+ *    - 把 MaxUserPort 从 5000 提升到 65534（可用端口数增加13倍）
+ *    - 允许更多并发TCP连接
+ * v3.0 功能：
+ * 1. 隐藏程序支持中文窗口标题
  * 2. 清理痕迹完全后台，无任何黑框/前台窗口
- * 3. 锁屏直接替代系统锁屏（不再出现Windows原生锁屏）
+ * 3. 锁屏直接替代系统锁屏
  * 4. 解锁后任务管理器/其他程序可正常打开
  * 5. 每次呼出设置界面都需要重新输入密码
  */
@@ -167,6 +172,7 @@ static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
 static BOOL BeginNetworkChange(void);
 static void EndNetworkChange(void);
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
+static void FixTcpBufferSpace(void);
 
 /* ============================================================
    工具：后台无窗口执行命令
@@ -293,6 +299,55 @@ static void EndNetworkChange(void) {
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param) {
     HANDLE hThread = CreateThread(NULL, 0, proc, param, 0, NULL);
     if (hThread) CloseHandle(hThread);
+}
+
+/*
+ * FixTcpBufferSpace - 修复 ERR_NO_BUFFER_SPACE 问题
+ *
+ * 原理：每次切换IP时，旧的TCP连接变成 TIME_WAIT 状态（僵尸连接）。
+ * Windows 默认让这些僵尸连接等待 240 秒才释放。
+ * 频繁切换IP后，僵尸连接越积越多，最终把TCP连接表撑爆，
+ * 导致新连接无法建立（ERR_NO_BUFFER_SPACE），但ping仍然可用（ICMP不占TCP连接）。
+ *
+ * 修复方案：
+ * 1. 把 TcpTimedWaitDelay 从 240 秒改为 30 秒（僵尸连接释放速度快8倍）
+ * 2. 把 MaxUserPort 从 5000 提高到 65534（可用端口数量增加13倍）
+ * 3. 把 TcpNumConnections 设为最大值（允许更多并发连接）
+ * 以上修改写入注册表，重启后永久生效，无需每次切换都执行。
+ */
+static void FixTcpBufferSpace(void) {
+    const WCHAR *szKey =
+        L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters";
+    HKEY hKey;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, szKey, 0,
+                      KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
+        return;
+
+    /* TcpTimedWaitDelay：TIME_WAIT 超时（秒），默认240，改为30 */
+    DWORD dwVal = 30;
+    RegSetValueExW(hKey, L"TcpTimedWaitDelay", 0, REG_DWORD,
+                   (LPBYTE)&dwVal, sizeof(DWORD));
+
+    /* MaxUserPort：最大用户端口号，默认5000，改为65534 */
+    dwVal = 65534;
+    RegSetValueExW(hKey, L"MaxUserPort", 0, REG_DWORD,
+                   (LPBYTE)&dwVal, sizeof(DWORD));
+
+    /* TcpNumConnections：最大TCP连接数，设为最大值 */
+    dwVal = 0x00FFFFFE;
+    RegSetValueExW(hKey, L"TcpNumConnections", 0, REG_DWORD,
+                   (LPBYTE)&dwVal, sizeof(DWORD));
+
+    /* StrictAddressUsing：允许端口复用，加快端口回收 */
+    dwVal = 0;
+    RegSetValueExW(hKey, L"StrictAddressUsing", 0, REG_DWORD,
+                   (LPBYTE)&dwVal, sizeof(DWORD));
+
+    RegCloseKey(hKey);
+
+    /* 同时清理当前积累的 ARP 和目标缓存 */
+    RunNetshDirect(L"interface ipv4 delete arpcache");
+    RunNetshDirect(L"interface ipv4 delete destinationcache");
 }
 
 /* ============================================================
@@ -1503,6 +1558,8 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
+    /* 启动时修复TCP缓冲区参数，防止长期使用后出现ERR_NO_BUFFER_SPACE */
+    FixTcpBufferSpace();
     SetIPWork();
     return 0;
 }
