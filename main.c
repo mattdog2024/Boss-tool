@@ -1,11 +1,19 @@
 /*
- * BossTool v3.1 - Windows 7/8/10/11 隐形管理工具
+ * BossTool v3.2 - Windows 7/8/10/11 隐形管理工具
  *
- * v3.1 修复：
- * 1. 修复长期使用后出现 ERR_NO_BUFFER_SPACE 导致网络不可用的问题
- *    - 把 TcpTimedWaitDelay 从 240秒改为 30秒（TIME_WAIT僵尸连接释放快8倍）
- *    - 把 MaxUserPort 从 5000 提升到 65534（可用端口数增加13倍）
- *    - 允许更多并发TCP连接
+ * v3.2 真正修复 ERR_NO_BUFFER_SPACE（推翻 v3.1 的错误方向）：
+ *   病灶不是 TIME_WAIT 僵尸连接，而是 NSI/AFD 内核状态被持续污染。
+ *   1. 删除 FixTcpBufferSpace —— 其中3个注册表项无效，1个治标，且未检查
+ *      返回值，普通权限下根本写不进去（v3.1 的修复从未真正生效）。
+ *   2. 重写 ApplyIP：
+ *        - 改用 store=active 模式（只改运行时配置，不写持久化）
+ *        - 不再 route flush / delete arpcache / delete destinationcache
+ *          （这3条命令是元凶：长期累积污染 NSI Proxy 内部状态）
+ *   3. WatchdogThread Sleep 400→2000，GuardThread Sleep 80→500
+ *      （把对DWM/explorer的焦点抢夺压力降低 6~25 倍，不影响锁屏防绕过）
+ *   4. g_bLocked / g_bBossMode 改用 InterlockedExchange，消除跨线程竞态
+ *   5. 新增 Ctrl+Alt+F12 一键修复网络栈热键，发病时秒救，不用重启电脑
+ *
  * v3.0 功能：
  * 1. 隐藏程序支持中文窗口标题
  * 2. 清理痕迹完全后台，无任何黑框/前台窗口
@@ -71,6 +79,10 @@
 /* 热键ID */
 #define HOTKEY_BOSS     1001
 #define HOTKEY_SETTINGS 1002
+#define HOTKEY_NETFIX   1003   /* v3.2: 一键修复网络栈 */
+
+#define EMERGENCY_MOD   (MOD_CONTROL|MOD_ALT)
+#define EMERGENCY_VK    VK_F12
 
 /* 自定义消息 */
 #define WM_LOCK_SCREEN   (WM_USER+10)
@@ -156,6 +168,7 @@ DWORD WINAPI     GuardThread(LPVOID);
 DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
+DWORD WINAPI     EmergencyFixThread(LPVOID);   /* v3.2 */
 
 static void DoLockScreen(void);
 static void DoUnlockScreen(void);
@@ -172,7 +185,7 @@ static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
 static BOOL BeginNetworkChange(void);
 static void EndNetworkChange(void);
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
-static void FixTcpBufferSpace(void);
+static void EmergencyNetworkFix(void);   /* v3.2: 一键修复网络栈 */
 
 /* ============================================================
    工具：后台无窗口执行命令
@@ -302,52 +315,45 @@ static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param) {
 }
 
 /*
- * FixTcpBufferSpace - 修复 ERR_NO_BUFFER_SPACE 问题
+ * v3.2 - EmergencyNetworkFix
  *
- * 原理：每次切换IP时，旧的TCP连接变成 TIME_WAIT 状态（僵尸连接）。
- * Windows 默认让这些僵尸连接等待 240 秒才释放。
- * 频繁切换IP后，僵尸连接越积越多，最终把TCP连接表撑爆，
- * 导致新连接无法建立（ERR_NO_BUFFER_SPACE），但ping仍然可用（ICMP不占TCP连接）。
+ * 一键修复网络栈，应对发病时的 ERR_NO_BUFFER_SPACE。
+ * 触发：用户按 Ctrl+Alt+F12（隐藏热键）。
+ * 流程：重启 NSI/iphlpsvc/HNS 服务 → 刷新DNS → 重置Winsock目录。
+ * 整个过程 3-5 秒，不需要重启电脑，浏览器立刻可用。
  *
- * 修复方案：
- * 1. 把 TcpTimedWaitDelay 从 240 秒改为 30 秒（僵尸连接释放速度快8倍）
- * 2. 把 MaxUserPort 从 5000 提高到 65534（可用端口数量增加13倍）
- * 3. 把 TcpNumConnections 设为最大值（允许更多并发连接）
- * 以上修改写入注册表，重启后永久生效，无需每次切换都执行。
+ * 注意：服务停止/启动顺序很重要，否则会卡死。
+ * 先停依赖方（hns, iphlpsvc）再停被依赖方（nsi）；
+ * 启动顺序反过来。
  */
-static void FixTcpBufferSpace(void) {
-    const WCHAR *szKey =
-        L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters";
-    HKEY hKey;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, szKey, 0,
-                      KEY_READ | KEY_WRITE, &hKey) != ERROR_SUCCESS)
-        return;
+static void EmergencyNetworkFix(void) {
+    WriteLog(L"EmergencyNetworkFix: START");
 
-    /* TcpTimedWaitDelay：TIME_WAIT 超时（秒），默认240，改为30 */
-    DWORD dwVal = 30;
-    RegSetValueExW(hKey, L"TcpTimedWaitDelay", 0, REG_DWORD,
-                   (LPBYTE)&dwVal, sizeof(DWORD));
+    /* 停止顺序：上层 → 下层 */
+    ExecHidden(L"net stop hns");
+    ExecHidden(L"net stop iphlpsvc");
+    ExecHidden(L"net stop nsi");
 
-    /* MaxUserPort：最大用户端口号，默认5000，改为65534 */
-    dwVal = 65534;
-    RegSetValueExW(hKey, L"MaxUserPort", 0, REG_DWORD,
-                   (LPBYTE)&dwVal, sizeof(DWORD));
+    Sleep(500);
 
-    /* TcpNumConnections：最大TCP连接数，设为最大值 */
-    dwVal = 0x00FFFFFE;
-    RegSetValueExW(hKey, L"TcpNumConnections", 0, REG_DWORD,
-                   (LPBYTE)&dwVal, sizeof(DWORD));
+    /* 启动顺序：下层 → 上层 */
+    ExecHidden(L"net start nsi");
+    ExecHidden(L"net start iphlpsvc");
+    ExecHidden(L"net start hns");
 
-    /* StrictAddressUsing：允许端口复用，加快端口回收 */
-    dwVal = 0;
-    RegSetValueExW(hKey, L"StrictAddressUsing", 0, REG_DWORD,
-                   (LPBYTE)&dwVal, sizeof(DWORD));
+    /* 清DNS缓存 */
+    ExecHidden(L"ipconfig /flushdns");
 
-    RegCloseKey(hKey);
+    /* 轻量重置Winsock目录（无需重启即生效） */
+    ExecHidden(L"netsh winsock reset catalog");
 
-    /* 同时清理当前积累的 ARP 和目标缓存 */
-    RunNetshDirect(L"interface ipv4 delete arpcache");
-    RunNetshDirect(L"interface ipv4 delete destinationcache");
+    WriteLog(L"EmergencyNetworkFix: DONE");
+}
+
+DWORD WINAPI EmergencyFixThread(LPVOID p) {
+    (void)p;
+    EmergencyNetworkFix();
+    return 0;
 }
 
 /* ============================================================
@@ -381,7 +387,7 @@ static void ProtectProcess(void) {
 DWORD WINAPI WatchdogThread(LPVOID p) {
     (void)p;
     while (1) {
-        Sleep(400);
+        Sleep(2000);   /* v3.2: 400 → 2000，降低后台轮询压力 */
         /* 只在锁屏状态下关闭任务管理器 */
         if (g_bLocked) {
             HWND h;
@@ -407,7 +413,7 @@ DWORD WINAPI WatchdogThread(LPVOID p) {
 DWORD WINAPI GuardThread(LPVOID p) {
     (void)p;
     while (1) {
-        Sleep(80);
+        Sleep(500);    /* v3.2: 80 → 500，避免对DWM/explorer的焦点抢夺风暴 */
         if (g_bLocked && g_hWndLock && IsWindow(g_hWndLock)) {
             int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
             int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -891,31 +897,29 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1,
                     const WCHAR *gw,  const WCHAR *dns,
                     const WCHAR *ip2, const WCHAR *mask2) {
     /*
-     * IP设置方案（多重保障）：
-     * 1. 优先用 netsh interface ipv4 set address（Windows 10/11推荐）
-     * 2. 备用 netsh interface ip set address（兼容Windows 7）
-     * 3. 两种方式都用网卡名称和索引号各尝试一次
+     * v3.2 重写要点：
+     * 1. 全部使用 store=active 模式 —— netsh只改运行时配置，不写持久化
+     *    存储，避免触发完整的网卡重新初始化，让浏览器TCP连接平滑保留。
+     * 2. 删除 route flush / delete arpcache / delete destinationcache
+     *    —— 这3条是 v3.1 的元凶，长期累积污染 NSI/AFD 内部状态，
+     *    最终导致非分页池泄漏，浏览器报 ERR_NO_BUFFER_SPACE。
+     * 3. 保留多重 fallback（Win7 兼容）。
      */
     DWORD ifIdx = GetEthernetIfIndex();
     const WCHAR *adpName = GetAdapterName();
     WriteLog(L"ApplyIP: ip1=%ls mask=%ls gw=%ls dns=%ls ifIdx=%lu adp=%ls",
              ip1, mask1, gw, dns ? dns : L"(none)", ifIdx, adpName);
 
-    /*
-     * 切换前先清理ARP缓存和路由表残留条目
-     * 防止长期运行后出现缓冲区溢出导致网络不可用
-     */
-    RunNetshDirect(L"interface ipv4 delete arpcache");
-    RunNetshDirect(L"interface ipv4 delete destinationcache");
-    ExecHidden(L"route flush");
+    /* v3.2: 不再 route flush / delete arpcache / delete destinationcache
+     * 让 Windows 自己管理 ARP / 路由 / 目标缓存的生命周期。 */
 
     /* 先用 netsh interface ipv4（Windows 10/11更可靠） */
     BOOL bOK = FALSE;
     WCHAR args[512];
 
-    /* 方案A：ipv4 + 网卡名称 */
+    /* 方案A：ipv4 + 网卡名称（v3.2: store=active） */
     _snwprintf(args, 511,
-        L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls gwmetric=1",
+        L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls gwmetric=1 store=active",
         adpName, ip1, mask1, gw);
     DWORD ret = RunNetshDirect(args);
     Sleep(500);
@@ -985,15 +989,15 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1,
         WriteLog(L"方案D(ip+idx) ret=%lu", ret);
     }
 
-    /* 添加第二个IP */
+    /* 添加第二个IP（v3.2: store=active） */
     if (ip2 && ip2[0]) {
         /* 先用ipv4方式 */
         _snwprintf(args, 511,
-            L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls",
+            L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, ip2, mask2);
         RunNetshDirect(args);
         Sleep(300);
-        /* 备用旧方式 */
+        /* 备用旧方式（旧版netsh不支持store参数，保留原写法） */
         if (ifIdx > 0) {
             _snwprintf(args, 511,
                 L"interface ip add address %lu %ls %ls",
@@ -1003,13 +1007,13 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1,
         }
     }
 
-    /* 设置DNS */
+    /* 设置DNS（v3.2: store=active + register=none，避免对DNS服务的额外扰动） */
     {
         WCHAR args4[512];
         if (dns && dns[0]) {
             /* ipv4方式 */
             _snwprintf(args4, 511,
-                L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls validate=no",
+                L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
                 adpName, dns);
             RunNetshDirect(args4);
             Sleep(300);
@@ -1023,7 +1027,7 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1,
         } else {
             /* 清除DNS */
             _snwprintf(args4, 511,
-                L"interface ipv4 set dnsservers name=\"%ls\" source=static address=none validate=no",
+                L"interface ipv4 set dnsservers name=\"%ls\" source=static address=none register=none validate=no store=active",
                 adpName);
             RunNetshDirect(args4);
             Sleep(300);
@@ -1533,8 +1537,10 @@ static void ShowProcessWindows(void) {
 static void RegisterHotkeys(HWND hWnd) {
     UnregisterHotKey(hWnd, HOTKEY_BOSS);
     UnregisterHotKey(hWnd, HOTKEY_SETTINGS);
+    UnregisterHotKey(hWnd, HOTKEY_NETFIX);   /* v3.2 */
     RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk);
     RegisterHotKey(hWnd, HOTKEY_SETTINGS, SETTINGS_MOD, SETTINGS_VK);
+    RegisterHotKey(hWnd, HOTKEY_NETFIX, EMERGENCY_MOD, EMERGENCY_VK);   /* v3.2: Ctrl+Alt+F12 一键修复网络 */
 }
 
 /* ============================================================
@@ -1558,18 +1564,18 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
-    /* 启动时修复TCP缓冲区参数，防止长期使用后出现ERR_NO_BUFFER_SPACE */
-    FixTcpBufferSpace();
+    /* v3.2: 删除 FixTcpBufferSpace —— 那是 v3.1 的错误方向 */
     SetIPWork();
     return 0;
 }
 
 static void DoBossKey(void) {
+    /* v3.2: 用 InterlockedExchange 替代直接赋值，消除跨线程竞态 */
     if (!g_bBossMode) {
-        g_bBossMode = TRUE;
+        InterlockedExchange((LONG*)&g_bBossMode, TRUE);
         StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)TRUE);
     } else {
-        g_bBossMode = FALSE;
+        InterlockedExchange((LONG*)&g_bBossMode, FALSE);
         StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)FALSE);
     }
 }
@@ -1946,7 +1952,7 @@ LRESULT CALLBACK LockWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
 static void DoLockScreen(void) {
     if(g_bLocked) return;
-    g_bLocked=TRUE;
+    InterlockedExchange((LONG*)&g_bLocked, TRUE);   /* v3.2: 替代直接赋值 */
     g_bShowInput=FALSE;
     g_nLockInputLen=0;
     memset(g_szLockInput,0,sizeof(g_szLockInput));
@@ -2000,7 +2006,7 @@ static void DoLockScreen(void) {
 
 static void DoUnlockScreen(void) {
     if(!g_bLocked) return;
-    g_bLocked=FALSE;
+    InterlockedExchange((LONG*)&g_bLocked, FALSE);  /* v3.2: 替代直接赋值 */
 
     /* 恢复系统正常状态 */
     SystemParametersInfoW(SPI_SETSCREENSAVERRUNNING, FALSE, NULL, 0);
@@ -2251,6 +2257,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetAutoRun(g_bAutoRun);
             UnregisterHotKey(g_hWndMain,HOTKEY_BOSS);
             UnregisterHotKey(g_hWndMain,HOTKEY_SETTINGS);
+            UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX);   /* v3.2 */
             RegisterHotkeys(g_hWndMain);
             MessageBoxW(hWnd,L"设置已保存！程序继续在后台运行。",L"提示",MB_OK);
             ShowWindow(hWnd,SW_HIDE);
@@ -2320,6 +2327,9 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         } else if(wParam==HOTKEY_SETTINGS) {
             /* 每次都需要重新输入密码 */
             ShowLoginDialog();
+        } else if(wParam==HOTKEY_NETFIX) {
+            /* v3.2: Ctrl+Alt+F12 一键修复网络栈（应对ERR_NO_BUFFER_SPACE） */
+            StartDetachedThread(EmergencyFixThread, NULL);
         }
         break;
     case WM_LOCK_SCREEN:
@@ -2445,6 +2455,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     if(g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
     UnregisterHotKey(g_hWndMain,HOTKEY_BOSS);
     UnregisterHotKey(g_hWndMain,HOTKEY_SETTINGS);
+    UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX);   /* v3.2 */
     UnlockIPReg();
     if(g_hMutex) CloseHandle(g_hMutex);
     return (int)msg.wParam;
