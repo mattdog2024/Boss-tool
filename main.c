@@ -80,9 +80,12 @@
 #define HOTKEY_BOSS     1001
 #define HOTKEY_SETTINGS 1002
 #define HOTKEY_NETFIX   1003   /* v3.2: 一键修复网络栈 */
+#define HOTKEY_NETFIX_ALT 1004 /* 兜底热键：Ctrl+Shift+F12 */
 
 #define EMERGENCY_MOD   (MOD_CONTROL|MOD_ALT)
 #define EMERGENCY_VK    VK_F12
+#define EMERGENCY_MOD_ALT (MOD_CONTROL|MOD_SHIFT)
+#define EMERGENCY_VK_ALT  VK_F12
 
 /* 自定义消息 */
 #define WM_LOCK_SCREEN   (WM_USER+10)
@@ -121,6 +124,9 @@ static HANDLE    g_hMutex       = NULL;
 static volatile BOOL g_bBossMode = FALSE;   /* 是否处于老板模式 */
 static volatile BOOL g_bLocked   = FALSE;   /* 是否处于锁屏状态 */
 static volatile LONG g_lNetworkChangeBusy = 0;
+static volatile LONG g_lEmergencyFixBusy  = 0;
+/* 随机MAC开关：默认关闭。频繁禁用/启用网卡会放大网络栈异常概率。 */
+static volatile BOOL g_bEnableMacRandomization = FALSE;
 /* 注意：不再保存登录状态，每次呼出设置都需要密码 */
 
 /* 配置 */
@@ -352,7 +358,13 @@ static void EmergencyNetworkFix(void) {
 
 DWORD WINAPI EmergencyFixThread(LPVOID p) {
     (void)p;
+    if (InterlockedCompareExchange(&g_lEmergencyFixBusy, 1, 0) != 0) {
+        return 0;
+    }
+    MessageBeep(MB_ICONEXCLAMATION);
     EmergencyNetworkFix();
+    InterlockedExchange(&g_lEmergencyFixBusy, 0);
+    MessageBeep(MB_OK);
     return 0;
 }
 
@@ -454,6 +466,16 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     /* ---- 拦截 Win+L，触发我们的锁屏 ---- */
     if (bDown && vk == 'L' && bWin && !g_bLocked) {
         PostMessage(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
+        return 1;
+    }
+
+    /*
+     * 紧急修复热键兜底：
+     * 1) RegisterHotKey 注册失败（被其他软件占用）时仍可触发
+     * 2) 锁屏钩子吞按键时，仍能触发
+     */
+    if (bDown && vk == VK_F12 && bCtrl && (bAlt || bShft)) {
+        StartDetachedThread(EmergencyFixThread, NULL);
         return 1;
     }
 
@@ -1210,8 +1232,10 @@ static void CloseNotepad(void) {
 
 static void SetIPWork(void) {
     if (!BeginNetworkChange()) return;
-    /* 切换前先随机更换MAC地址 */
-    RandomizeMac();
+    /* 默认关闭随机MAC：频繁重置网卡会触发内核网络栈不稳定 */
+    if (g_bEnableMacRandomization) {
+        RandomizeMac();
+    }
     wcsncpy(g_szExpectedIP, IP_WORK1, 63);
     ApplyIP(IP_WORK1, IP_WORK_MASK, IP_WORK_GW, IP_WORK_DNS,
             IP_WORK2, IP_WORK_MASK);
@@ -1223,8 +1247,10 @@ static void SetIPWork(void) {
 
 static void SetIPBoss(void) {
     if (!BeginNetworkChange()) return;
-    /* 切换前先随机更换MAC地址 */
-    RandomizeMac();
+    /* 默认关闭随机MAC：频繁重置网卡会触发内核网络栈不稳定 */
+    if (g_bEnableMacRandomization) {
+        RandomizeMac();
+    }
     wcsncpy(g_szExpectedIP, IP_BOSS, 63);
     /* 老板模式：不设置 DNS */
     ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
@@ -1537,10 +1563,24 @@ static void ShowProcessWindows(void) {
 static void RegisterHotkeys(HWND hWnd) {
     UnregisterHotKey(hWnd, HOTKEY_BOSS);
     UnregisterHotKey(hWnd, HOTKEY_SETTINGS);
-    UnregisterHotKey(hWnd, HOTKEY_NETFIX);   /* v3.2 */
-    RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk);
-    RegisterHotKey(hWnd, HOTKEY_SETTINGS, SETTINGS_MOD, SETTINGS_VK);
-    RegisterHotKey(hWnd, HOTKEY_NETFIX, EMERGENCY_MOD, EMERGENCY_VK);   /* v3.2: Ctrl+Alt+F12 一键修复网络 */
+    UnregisterHotKey(hWnd, HOTKEY_NETFIX);      /* v3.2 */
+    UnregisterHotKey(hWnd, HOTKEY_NETFIX_ALT);  /* 兜底 */
+
+    if (!RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk)) {
+        WriteLog(L"RegisterHotKey BOSS failed err=%lu", GetLastError());
+    }
+    if (!RegisterHotKey(hWnd, HOTKEY_SETTINGS, SETTINGS_MOD, SETTINGS_VK)) {
+        WriteLog(L"RegisterHotKey SETTINGS failed err=%lu", GetLastError());
+    }
+
+    /* 主热键：Ctrl+Alt+F12 */
+    if (!RegisterHotKey(hWnd, HOTKEY_NETFIX, EMERGENCY_MOD, EMERGENCY_VK)) {
+        WriteLog(L"RegisterHotKey NETFIX failed err=%lu, try fallback", GetLastError());
+    }
+    /* 兜底热键：Ctrl+Shift+F12，避免与输入法/驱动冲突 */
+    if (!RegisterHotKey(hWnd, HOTKEY_NETFIX_ALT, EMERGENCY_MOD_ALT, EMERGENCY_VK_ALT)) {
+        WriteLog(L"RegisterHotKey NETFIX_ALT failed err=%lu", GetLastError());
+    }
 }
 
 /* ============================================================
@@ -2327,8 +2367,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         } else if(wParam==HOTKEY_SETTINGS) {
             /* 每次都需要重新输入密码 */
             ShowLoginDialog();
-        } else if(wParam==HOTKEY_NETFIX) {
-            /* v3.2: Ctrl+Alt+F12 一键修复网络栈（应对ERR_NO_BUFFER_SPACE） */
+        } else if(wParam==HOTKEY_NETFIX || wParam==HOTKEY_NETFIX_ALT) {
+            /* v3.2+: Ctrl+Alt+F12 主热键，Ctrl+Shift+F12 兜底 */
             StartDetachedThread(EmergencyFixThread, NULL);
         }
         break;
@@ -2455,7 +2495,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     if(g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
     UnregisterHotKey(g_hWndMain,HOTKEY_BOSS);
     UnregisterHotKey(g_hWndMain,HOTKEY_SETTINGS);
-    UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX);   /* v3.2 */
+    UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX);      /* v3.2 */
+    UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX_ALT);  /* 兜底 */
     UnlockIPReg();
     if(g_hMutex) CloseHandle(g_hMutex);
     return (int)msg.wParam;
