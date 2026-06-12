@@ -41,3 +41,12 @@ x86_64-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool.exe main.c \
 i686-w64-mingw32-gcc -O2 -municode -mwindows -o BossTool_x86.exe main.c \
     -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
 ```
+
+## 迭代与发布流程（必看）
+
+长期迭代请严格遵循：[`RELEASE_PROCESS.md`](./RELEASE_PROCESS.md)
+
+简版规则：
+1. 每次开始先声明：基于哪个版本、目标是什么、回归标准是什么、哪些行为不能动。
+2. 每次改动都要有 commit，发布必须带 tag + release + exe + sha256。
+3. 不再依赖聊天记忆，统一以仓库文档和提交记录为准。
