@@ -418,14 +418,16 @@ static BOOL EnsureVirtualDiskService(void) {
 }
 
 /*
- * 核心挂载函数
+ * 核心挂载函数 v3.3.2
+ * 改用 PowerShell Mount-DiskImage，彻底解决：
+ *   - 非标准扩展名（.lvm）问题：diskpart 对非 .vhd/.vhdx 扩展名静默失败
+ *   - 中文路径问题：PowerShell 原生 Unicode，无编码问题
+ *   - VDS 服务依赖：Mount-DiskImage 不依赖 Virtual Disk 服务
+ *
  * 流程：
- *   1. 确保 Virtual Disk 服务运行
- *   2. 写 diskpart 脚本（UTF-16 LE BOM，解决中文路径问题）
- *   3. 执行 diskpart attach vdisk
- *   4. 等待新盘符出现（最多 20 秒）
- *   5. 用 manage-bde 解锁 BitLocker
- *   6. 记录挂载的盘符
+ *   1. 用 PowerShell Mount-DiskImage 挂载（支持任意扩展名）
+ *   2. 等待新盘符出现（最多 30 秒）
+ *   3. 用 PowerShell + manage-bde 解锁 BitLocker
  *
  * hWndParent: 用于弹出错误框，NULL 则静默
  * 返回 TRUE 表示成功
@@ -453,114 +455,129 @@ static BOOL VaultMount(HWND hWndParent) {
 
     WriteLog(L"VaultMount: 开始挂载 [%ls]", g_szVaultPath);
 
-    /* 步骤1: 确保 Virtual Disk 服务 */
-    EnsureVirtualDiskService();
-
-    /* 步骤2: 记录挂载前盘符 */
+    /* 步骤1: 记录挂载前盘符 */
     DWORD dwBefore = GetAllDrives();
 
-    /* 步骤3: 写 diskpart 脚本
-     * 关键：必须用 UTF-16 LE BOM 写入，否则中文路径乱码
-     * diskpart 在 Windows 10/11 上支持 UTF-16 脚本文件
+    /* 步骤2: 用 PowerShell Mount-DiskImage 挂载
+     * 优势：
+     *   - 支持任意扩展名（.lvm .vhd .vhdx 都行）
+     *   - 原生 Unicode，中文路径无问题
+     *   - 不依赖 Virtual Disk 服务
+     *   - 不依赖 diskpart
+     *
+     * PowerShell 命令：
+     *   Mount-DiskImage -ImagePath "路径" -NoDriveLetter:$false
      */
-    WCHAR szScript[MAX_PATH];
-    GetTempPathW(MAX_PATH, szScript);
-    wcsncat(szScript, L"vaultmount.txt", MAX_PATH - wcslen(szScript) - 1);
-
-    HANDLE hFile = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        WriteLog(L"VaultMount: 无法创建脚本文件 err=%lu", GetLastError());
-        if (hWndParent)
-            MessageBoxW(hWndParent, L"无法创建临时脚本文件！", L"错误",
-                        MB_OK | MB_ICONERROR);
-        return FALSE;
-    }
-
-    /* 写 BOM */
-    BYTE bom[2] = {0xFF, 0xFE};
-    DWORD written;
-    WriteFile(hFile, bom, 2, &written, NULL);
-
-    /* 写脚本内容（宽字符） */
-    WCHAR szContent[1024];
-    _snwprintf(szContent, 1023,
-        L"select vdisk file=\"%ls\"\r\n"
-        L"attach vdisk\r\n",
+    WCHAR szPS[MAX_PATH + 256];
+    _snwprintf(szPS, MAX_PATH + 255,
+        L"Mount-DiskImage -ImagePath '%ls'",
         g_szVaultPath);
-    szContent[1023] = 0;
-    WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
-              &written, NULL);
-    CloseHandle(hFile);
+    szPS[MAX_PATH + 255] = 0;
 
-    WriteLog(L"VaultMount: diskpart 脚本已写入 [%ls]", szScript);
+    WriteLog(L"VaultMount: 执行 PowerShell: %ls", szPS);
+    ExecPowerShell(szPS, TRUE, 30000);
 
-    /* 步骤4: 执行 diskpart */
-    WCHAR szCmd[MAX_PATH + 64];
-    _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
-    szCmd[MAX_PATH + 63] = 0;
-
-    DWORD exitCode = ExecHiddenEx(szCmd);
-    WriteLog(L"VaultMount: diskpart 退出码=%lu", exitCode);
-
-    /* 删除临时脚本 */
-    DeleteFileW(szScript);
-
-    /* 步骤5: 等待新盘符出现（最多 20 秒） */
+    /* 步骤3: 等待新盘符出现（最多 30 秒） */
     WCHAR cDrive = 0;
-    if (!WaitForDriveLetter(dwBefore, &cDrive, 20000)) {
-        WriteLog(L"VaultMount: 等待盘符超时，attach 失败");
-        if (hWndParent) {
-            WCHAR msg[512];
-            _snwprintf(msg, 511,
-                L"挂载失败！\r\n\r\n"
-                L"诊断信息：\r\n"
-                L"attach后无新盘符出现（等待20s超时）\r\n"
-                L"diskpart退出码=%lu\r\n\r\n"
-                L"可能原因：\r\n"
-                L"1. 文件非有效VHDX格式\r\n"
-                L"2. 需要管理员权限运行本程序\r\n"
-                L"3. VDS(Virtual Disk)服务未运行\r\n"
-                L"   Win+R → services.msc → Virtual Disk → 启动\r\n"
-                L"4. 路径不能含中文（当前版本限制）\r\n\r\n"
-                L"通用排查：\r\n"
-                L"• 确认以管理员身份运行\r\n"
-                L"• 确认VHD磁盘虚拟化服务已启动\r\n"
-                L"• 路径不能含中文（当前版本限制）",
-                exitCode);
-            msg[511] = 0;
-            MessageBoxW(hWndParent, msg, L"挂载失败！", MB_OK | MB_ICONERROR);
+    if (!WaitForDriveLetter(dwBefore, &cDrive, 30000)) {
+        WriteLog(L"VaultMount: 等待盘符超时，Mount-DiskImage 失败");
+
+        /* 尝试用 diskpart 作为备用方案 */
+        WriteLog(L"VaultMount: 尝试 diskpart 备用方案");
+        EnsureVirtualDiskService();
+
+        WCHAR szScript[MAX_PATH];
+        GetTempPathW(MAX_PATH, szScript);
+        wcsncat(szScript, L"vaultmount.txt", MAX_PATH - wcslen(szScript) - 1);
+
+        HANDLE hFile = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            BYTE bom[2] = {0xFF, 0xFE};
+            DWORD written;
+            WriteFile(hFile, bom, 2, &written, NULL);
+            WCHAR szContent[1024];
+            _snwprintf(szContent, 1023,
+                L"select vdisk file=\"%ls\"\r\n"
+                L"attach vdisk\r\n",
+                g_szVaultPath);
+            szContent[1023] = 0;
+            WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
+                      &written, NULL);
+            CloseHandle(hFile);
+
+            WCHAR szCmd[MAX_PATH + 64];
+            _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
+            szCmd[MAX_PATH + 63] = 0;
+            DWORD exitCode = ExecHiddenEx(szCmd);
+            WriteLog(L"VaultMount: diskpart 备用退出码=%lu", exitCode);
+            DeleteFileW(szScript);
+
+            /* 再等 20 秒 */
+            if (!WaitForDriveLetter(dwBefore, &cDrive, 20000)) {
+                WriteLog(L"VaultMount: diskpart 备用也失败");
+                if (hWndParent) {
+                    WCHAR msg[768];
+                    _snwprintf(msg, 767,
+                        L"挂载失败！\r\n\r\n"
+                        L"已尝试两种方法（PowerShell + diskpart）均失败。\r\n\r\n"
+                        L"诊断信息：\r\n"
+                        L"• PowerShell Mount-DiskImage：无新盘符（30s超时）\r\n"
+                        L"• diskpart attach vdisk：无新盘符（20s超时），退出码=%lu\r\n\r\n"
+                        L"请排查：\r\n"
+                        L"1. 文件是否为有效的 VHDX 格式（用 PowerShell 验证）\r\n"
+                        L"   命令：Test-Path '%ls'\r\n"
+                        L"2. 以管理员身份运行本程序\r\n"
+                        L"3. Win+R → services.msc → Virtual Disk → 启动\r\n"
+                        L"4. 在 PowerShell(管理员) 手动测试：\r\n"
+                        L"   Mount-DiskImage -ImagePath '%ls'",
+                        exitCode, g_szVaultPath, g_szVaultPath);
+                    msg[767] = 0;
+                    MessageBoxW(hWndParent, msg, L"挂载失败！", MB_OK | MB_ICONERROR);
+                }
+                return FALSE;
+            }
+        } else {
+            if (hWndParent) {
+                MessageBoxW(hWndParent,
+                    L"挂载失败！PowerShell Mount-DiskImage 无新盘符（30s超时）\r\n"
+                    L"请以管理员身份运行，并确认文件为有效 VHDX 格式。",
+                    L"挂载失败！", MB_OK | MB_ICONERROR);
+            }
+            return FALSE;
         }
-        return FALSE;
     }
 
     WriteLog(L"VaultMount: 新盘符 %lc: 已出现", cDrive);
 
-    /* 步骤6: 用 manage-bde 解锁 BitLocker */
-    /* 等待盘符稳定 */
-    Sleep(1000);
+    /* 步骤4: 等待盘符稳定 */
+    Sleep(1500);
 
-    WCHAR szUnlock[512];
-    _snwprintf(szUnlock, 511,
-        L"manage-bde -unlock %lc: -password",
-        cDrive);
-    szUnlock[511] = 0;
+    /* 步骤5: 用 PowerShell + manage-bde 解锁 BitLocker
+     * 用 PowerShell 传递密码，避免 cmd echo 的特殊字符问题
+     * PowerShell 命令：
+     *   $pwd = ConvertTo-SecureString '密码' -AsPlainText -Force
+     *   Unlock-BitLocker -MountPoint 'X:' -Password $pwd
+     * 如果 Unlock-BitLocker 不可用（旧版），退回 manage-bde
+     */
+    WCHAR szUnlockPS[1024];
+    _snwprintf(szUnlockPS, 1023,
+        L"try { "
+        L"$p = ConvertTo-SecureString '%ls' -AsPlainText -Force; "
+        L"Unlock-BitLocker -MountPoint '%lc:' -Password $p "
+        L"} catch { "
+        L"cmd /c 'echo %ls | manage-bde -unlock %lc: -password' "
+        L"}",
+        g_szVaultPwd, cDrive, g_szVaultPwd, cDrive);
+    szUnlockPS[1023] = 0;
 
-    /* manage-bde 需要从 stdin 读取密码，用管道方式传入 */
-    /* 方法：echo 密码 | manage-bde -unlock X: -password */
-    WCHAR szUnlockCmd[1024];
-    _snwprintf(szUnlockCmd, 1023,
-        L"echo %ls | manage-bde -unlock %lc: -password",
-        g_szVaultPwd, cDrive);
-    szUnlockCmd[1023] = 0;
-
-    DWORD unlockExit = ExecHiddenEx(szUnlockCmd);
-    WriteLog(L"VaultMount: manage-bde 解锁退出码=%lu", unlockExit);
+    WriteLog(L"VaultMount: 执行 BitLocker 解锁");
+    ExecPowerShell(szUnlockPS, TRUE, 15000);
 
     /* 等待解锁完成 */
     Sleep(2000);
 
-    /* 验证盘符是否可访问 */
+    /* 步骤6: 验证盘符是否可访问 */
     WCHAR szTest[8];
     _snwprintf(szTest, 7, L"%lc:\\", cDrive);
     DWORD attrs = GetFileAttributesW(szTest);
@@ -570,9 +587,8 @@ static BOOL VaultMount(HWND hWndParent) {
             WCHAR msg[256];
             _snwprintf(msg, 255,
                 L"VHDX 已挂载为 %lc:，但 BitLocker 解锁失败。\r\n"
-                L"请检查密码是否正确。\r\n"
-                L"manage-bde 退出码: %lu",
-                cDrive, unlockExit);
+                L"请检查密码是否正确。",
+                cDrive);
             msg[255] = 0;
             MessageBoxW(hWndParent, msg, L"BitLocker 解锁失败",
                         MB_OK | MB_ICONWARNING);
@@ -621,49 +637,64 @@ static BOOL VaultEject(HWND hWndParent) {
 
     WriteLog(L"VaultEject: 开始弹出 %ls", g_szVaultDrive);
 
-    /* 步骤1: 先锁定 BitLocker（防止数据泄露） */
+    /* 步骤1: 先用 PowerShell 锁定 BitLocker（防止数据泄露） */
     if (g_szVaultDrive[0]) {
-        WCHAR szLock[64];
-        _snwprintf(szLock, 63, L"manage-bde -lock %ls -ForceDismount",
-                   g_szVaultDrive);
-        szLock[63] = 0;
-        ExecHiddenEx(szLock);
+        WCHAR szLockPS[256];
+        _snwprintf(szLockPS, 255,
+            L"try { Lock-BitLocker -MountPoint '%lc:' -ForceDismount } "
+            L"catch { manage-bde -lock %lc: -ForceDismount }",
+            g_szVaultDrive[0], g_szVaultDrive[0]);
+        szLockPS[255] = 0;
+        ExecPowerShell(szLockPS, TRUE, 8000);
         Sleep(500);
     }
 
-    /* 步骤2: 写 diskpart detach 脚本（UTF-16 LE BOM） */
-    WCHAR szScript[MAX_PATH];
-    GetTempPathW(MAX_PATH, szScript);
-    wcsncat(szScript, L"vaulteject.txt", MAX_PATH - wcslen(szScript) - 1);
+    /* 步骤2: 用 PowerShell Dismount-DiskImage 弹出
+     * 同样不依赖 diskpart，支持任意扩展名
+     */
+    WCHAR szDismountPS[MAX_PATH + 256];
+    _snwprintf(szDismountPS, MAX_PATH + 255,
+        L"Dismount-DiskImage -ImagePath '%ls'",
+        g_szVaultPath);
+    szDismountPS[MAX_PATH + 255] = 0;
 
-    HANDLE hFile = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
-                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile != INVALID_HANDLE_VALUE) {
-        BYTE bom[2] = {0xFF, 0xFE};
-        DWORD written;
-        WriteFile(hFile, bom, 2, &written, NULL);
+    WriteLog(L"VaultEject: 执行 PowerShell Dismount-DiskImage");
+    ExecPowerShell(szDismountPS, TRUE, 15000);
 
-        WCHAR szContent[1024];
-        _snwprintf(szContent, 1023,
-            L"select vdisk file=\"%ls\"\r\n"
-            L"detach vdisk\r\n",
-            g_szVaultPath);
-        szContent[1023] = 0;
-        WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
-                  &written, NULL);
-        CloseHandle(hFile);
-
-        /* 步骤3: 执行 diskpart */
-        WCHAR szCmd[MAX_PATH + 64];
-        _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
-        szCmd[MAX_PATH + 63] = 0;
-        DWORD exitCode = ExecHiddenEx(szCmd);
-        WriteLog(L"VaultEject: diskpart detach 退出码=%lu", exitCode);
-
-        DeleteFileW(szScript);
+    /* 备用：如果 PowerShell 弹出失败，用 diskpart */
+    Sleep(1000);
+    DWORD dwAfter = GetAllDrives();
+    if (g_szVaultDrive[0] && (dwAfter & (1u << (g_szVaultDrive[0] - 'A')))) {
+        WriteLog(L"VaultEject: PowerShell 弹出后盘符仍存在，尝试 diskpart");
+        EnsureVirtualDiskService();
+        WCHAR szScript[MAX_PATH];
+        GetTempPathW(MAX_PATH, szScript);
+        wcsncat(szScript, L"vaulteject.txt", MAX_PATH - wcslen(szScript) - 1);
+        HANDLE hFile = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            BYTE bom[2] = {0xFF, 0xFE};
+            DWORD written;
+            WriteFile(hFile, bom, 2, &written, NULL);
+            WCHAR szContent[1024];
+            _snwprintf(szContent, 1023,
+                L"select vdisk file=\"%ls\"\r\n"
+                L"detach vdisk\r\n",
+                g_szVaultPath);
+            szContent[1023] = 0;
+            WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
+                      &written, NULL);
+            CloseHandle(hFile);
+            WCHAR szCmd[MAX_PATH + 64];
+            _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
+            szCmd[MAX_PATH + 63] = 0;
+            DWORD exitCode = ExecHiddenEx(szCmd);
+            WriteLog(L"VaultEject: diskpart 备用退出码=%lu", exitCode);
+            DeleteFileW(szScript);
+        }
     }
 
-    /* 步骤4: 等待盘符消失 */
+    /* 步骤3: 等待盘符消失 */
     Sleep(2000);
 
     /* 步骤5: 清理文件管理器中的盘符访问记录 */
