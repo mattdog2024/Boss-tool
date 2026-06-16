@@ -140,10 +140,11 @@ static BOOL  g_bAutoRun         = FALSE;
 static WCHAR g_szHideList[2048] = L"";
 
 /* v3.3: 隐私保险箱配置 */
-static WCHAR g_szVaultPath[MAX_PATH] = L"";   /* .lvm 文件路径 */
-static WCHAR g_szVaultPwd[128]       = L"";   /* BitLocker 密码（内存中明文，注册表中 XOR 混淆） */
-static WCHAR g_szVaultDrive[4]       = L"";   /* 当前挂载的盘符，如 L"E:" */
-static volatile BOOL g_bVaultMounted = FALSE; /* 是否已挂载 */
+static WCHAR g_szVaultPath[MAX_PATH]    = L"";   /* .lvm 文件路径 */
+static WCHAR g_szVaultPwd[128]          = L"";   /* BitLocker 密码（内存中明文，注册表中 XOR 混淆） */
+static WCHAR g_szVaultDrive[4]          = L"";   /* 当前挂载的盘符，如 L"E:" */
+static WCHAR g_szVaultSymlink[MAX_PATH] = L"";   /* 临时符号链接路径（.vhdx 扩展名） */
+static volatile BOOL g_bVaultMounted    = FALSE; /* 是否已挂载 */
 
 /* 锁屏状态 */
 static int   g_nLockFail        = 0;
@@ -212,6 +213,10 @@ static WCHAR FindNewDriveLetter(DWORD dwBefore);
 static DWORD GetAllDrives(void);
 static BOOL  EnsureVirtualDiskService(void);
 static BOOL  WaitForDriveLetter(DWORD dwBefore, WCHAR *pDrive, DWORD timeoutMs);
+static BOOL  CreateVaultSymlink(void);    /* 创建 .vhdx 符号链接 */
+static void  CleanupVaultSymlink(void);   /* 删除符号链接 */
+static BOOL  ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int outLen); /* 执行 PS 并返回输出 */
+static BOOL  GetDriveLetterForImage(const WCHAR *imagePath, WCHAR *pDrive); /* 通过 PS 查询盘符 */
 
 /* ============================================================
    工具：后台无窗口执行命令（带返回值）
@@ -418,6 +423,192 @@ static BOOL EnsureVirtualDiskService(void) {
 }
 
 /*
+ * v3.3.3: 创建符号链接
+ * AppHider 的核心秘诀：把 .lvm 文件符号链接为 .vhdx 扩展名
+ * Mount-DiskImage 必须有 .vhdx/.iso 扩展名才能挂载
+ */
+static BOOL CreateVaultSymlink(void) {
+    if (!g_szVaultPath[0]) return FALSE;
+
+    /* 生成唯一符号链接路径：%TEMP%\BossVault_XXXX.vhdx */
+    WCHAR szTemp[MAX_PATH];
+    GetTempPathW(MAX_PATH, szTemp);
+    WCHAR szGuid[64];
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    _snwprintf(szGuid, 63, L"BossVault_%04d%02d%02d%02d%02d%02d%03d.vhdx",
+               st.wYear, st.wMonth, st.wDay,
+               st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    _snwprintf(g_szVaultSymlink, MAX_PATH-1, L"%ls%ls", szTemp, szGuid);
+    g_szVaultSymlink[MAX_PATH-1] = 0;
+
+    /* 先删除可能存在的旧符号链接 */
+    DeleteFileW(g_szVaultSymlink);
+
+    /* 用 PowerShell New-Item -ItemType SymbolicLink 创建
+     * 注：创建符号链接需要管理员权限或开发者模式
+     * 备用：用 cmd mklink
+     */
+    WCHAR szPS[MAX_PATH * 2 + 128];
+    _snwprintf(szPS, MAX_PATH*2+127,
+        L"New-Item -ItemType SymbolicLink -Path '%ls' -Target '%ls' -Force",
+        g_szVaultSymlink, g_szVaultPath);
+    szPS[MAX_PATH*2+127] = 0;
+
+    ExecPowerShell(szPS, TRUE, 5000);
+
+    /* 检查符号链接是否创建成功 */
+    if (GetFileAttributesW(g_szVaultSymlink) != INVALID_FILE_ATTRIBUTES) {
+        WriteLog(L"CreateVaultSymlink: 成功 [%ls] -> [%ls]", g_szVaultSymlink, g_szVaultPath);
+        return TRUE;
+    }
+
+    /* PowerShell 失败，尝试 cmd mklink */
+    WriteLog(L"CreateVaultSymlink: PowerShell 失败，尝试 cmd mklink");
+    WCHAR szCmd[MAX_PATH * 2 + 64];
+    _snwprintf(szCmd, MAX_PATH*2+63,
+        L"cmd /c mklink \"%ls\" \"%ls\"",
+        g_szVaultSymlink, g_szVaultPath);
+    szCmd[MAX_PATH*2+63] = 0;
+    ExecHiddenEx(szCmd);
+
+    if (GetFileAttributesW(g_szVaultSymlink) != INVALID_FILE_ATTRIBUTES) {
+        WriteLog(L"CreateVaultSymlink: mklink 成功");
+        return TRUE;
+    }
+
+    WriteLog(L"CreateVaultSymlink: 失败，无法创建符号链接");
+    g_szVaultSymlink[0] = 0;
+    return FALSE;
+}
+
+/* 删除符号链接 */
+static void CleanupVaultSymlink(void) {
+    if (g_szVaultSymlink[0]) {
+        DeleteFileW(g_szVaultSymlink);
+        WriteLog(L"CleanupVaultSymlink: 删除 [%ls]", g_szVaultSymlink);
+        g_szVaultSymlink[0] = 0;
+    }
+}
+
+/* 执行 PowerShell 并返回标准输出 */
+static BOOL ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int outLen) {
+    if (outBuf && outLen > 0) outBuf[0] = 0;
+
+    WCHAR szPS[MAX_PATH] = {0};
+    GetSystemDirectoryW(szPS, MAX_PATH);
+    wcsncat(szPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe",
+            MAX_PATH - wcslen(szPS) - 1);
+    if (GetFileAttributesW(szPS) == INVALID_FILE_ATTRIBUTES) {
+        WCHAR szWin[MAX_PATH] = {0};
+        GetWindowsDirectoryW(szWin, MAX_PATH);
+        _snwprintf(szPS, MAX_PATH-1,
+            L"%ls\\SysNative\\WindowsPowerShell\\v1.0\\powershell.exe", szWin);
+    }
+
+    WCHAR cmdLine[4096];
+    _snwprintf(cmdLine, 4095,
+        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -Command \"%ls\"",
+        szPS, psScript);
+    cmdLine[4095] = 0;
+
+    /* 创建匿名管道读取输出 */
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return FALSE;
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError  = hWritePipe;
+
+    BOOL ok = CreateProcessW(szPS, cmdLine, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(hWritePipe);
+
+    if (!ok) {
+        CloseHandle(hReadPipe);
+        return FALSE;
+    }
+
+    /* 读取输出（ANSI） */
+    char ansiOut[1024] = {0};
+    DWORD bytesRead = 0, totalRead = 0;
+    while (totalRead < (DWORD)sizeof(ansiOut)-1) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) break;
+            continue;
+        }
+        if (!ReadFile(hReadPipe, ansiOut + totalRead,
+                      min(avail, (DWORD)sizeof(ansiOut)-1-totalRead),
+                      &bytesRead, NULL)) break;
+        totalRead += bytesRead;
+    }
+    ansiOut[totalRead] = 0;
+
+    WaitForSingleObject(pi.hProcess, 5000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hReadPipe);
+
+    /* 转换输出到宽字符 */
+    if (outBuf && outLen > 0) {
+        MultiByteToWideChar(CP_ACP, 0, ansiOut, -1, outBuf, outLen);
+        /* 去除首尾空白 */
+        int n = (int)wcslen(outBuf);
+        while (n > 0 && (outBuf[n-1] == L'\r' || outBuf[n-1] == L'\n' ||
+                         outBuf[n-1] == L' ')) {
+            outBuf[--n] = 0;
+        }
+    }
+
+    WriteLog(L"ExecPSWithOutput: exit=%lu out=[%ls]", exitCode, outBuf ? outBuf : L"");
+    return (exitCode == 0);
+}
+
+/* 通过 PowerShell 查询已挂载镜像的盘符字母
+ * 使用 AppHider 相同的命令：
+ * Get-DiskImage -ImagePath '...' | Get-Disk | Get-Partition | Get-Volume |
+ *   Select-Object -ExpandProperty DriveLetter
+ */
+static BOOL GetDriveLetterForImage(const WCHAR *imagePath, WCHAR *pDrive) {
+    *pDrive = 0;
+    WCHAR szPS[MAX_PATH + 256];
+    _snwprintf(szPS, MAX_PATH+255,
+        L"Get-DiskImage -ImagePath '%ls' | "
+        L"Get-Disk | Get-Partition | Get-Volume | "
+        L"Select-Object -ExpandProperty DriveLetter",
+        imagePath);
+    szPS[MAX_PATH+255] = 0;
+
+    WCHAR outBuf[32] = {0};
+    ExecPowerShellWithOutput(szPS, outBuf, 31);
+
+    /* 输出应该是单个字母，如 "E" */
+    if (outBuf[0] >= L'A' && outBuf[0] <= L'Z') {
+        *pDrive = outBuf[0];
+        WriteLog(L"GetDriveLetterForImage: 盘符=%lc", *pDrive);
+        return TRUE;
+    }
+    if (outBuf[0] >= L'a' && outBuf[0] <= L'z') {
+        *pDrive = (WCHAR)(outBuf[0] - L'a' + L'A');
+        WriteLog(L"GetDriveLetterForImage: 盘符=%lc", *pDrive);
+        return TRUE;
+    }
+    WriteLog(L"GetDriveLetterForImage: 未能获取盘符，输出=[%ls]", outBuf);
+    return FALSE;
+}
+
+/*
  * 核心挂载函数 v3.3.2
  * 改用 PowerShell Mount-DiskImage，彻底解决：
  *   - 非标准扩展名（.lvm）问题：diskpart 对非 .vhd/.vhdx 扩展名静默失败
@@ -453,131 +644,102 @@ static BOOL VaultMount(HWND hWndParent) {
         return FALSE;
     }
 
-    WriteLog(L"VaultMount: 开始挂载 [%ls]", g_szVaultPath);
+    WriteLog(L"VaultMount v3.3.3: 开始挂载 [%ls]", g_szVaultPath);
 
-    /* 步骤1: 记录挂载前盘符 */
+    /* ============================================================
+     * v3.3.3 核心方案（参考 AppHider VHDXManager.cs）
+     *
+     * 根本原因：Mount-DiskImage 必须有 .vhdx/.iso 扩展名
+     * 解决方案：创建临时符号链接 .lvm -> .vhdx，挂载符号链接
+     * 挂载后用 Get-DiskImage 管道查询盘符（比等待盘符更可靠）
+     * ============================================================ */
+
+    /* 步骤1: 创建符号链接 BossVault_xxx.vhdx -> F:\system-bak.lvm */
+    WriteLog(L"VaultMount: 步骤1 创建 .vhdx 符号链接");
+    if (!CreateVaultSymlink()) {
+        if (hWndParent) {
+            WCHAR msg[512];
+            _snwprintf(msg, 511,
+                L"创建符号链接失败！\r\n\r\n"
+                L"这通常是因为：\r\n"
+                L"1. 未以管理员身份运行\r\n"
+                L"2. Windows 未开启开发者模式（设置→更新和安全→开发者选项）\r\n\r\n"
+                L"请先开启开发者模式或以管理员身份运行本程序。",
+                0);
+            msg[511] = 0;
+            MessageBoxW(hWndParent, msg, L"符号链接失败", MB_OK | MB_ICONERROR);
+        }
+        return FALSE;
+    }
+    WriteLog(L"VaultMount: 符号链接已创建 [%ls]", g_szVaultSymlink);
+
+    /* 步骤2: 记录挂载前盘符状态 */
     DWORD dwBefore = GetAllDrives();
 
-    /* 步骤2: 用 PowerShell Mount-DiskImage 挂载
-     * 优势：
-     *   - 支持任意扩展名（.lvm .vhd .vhdx 都行）
-     *   - 原生 Unicode，中文路径无问题
-     *   - 不依赖 Virtual Disk 服务
-     *   - 不依赖 diskpart
-     *
-     * PowerShell 命令：
-     *   Mount-DiskImage -ImagePath "路径" -NoDriveLetter:$false
-     */
+    /* 步骤3: 用 PowerShell Mount-DiskImage 挂载符号链接（而非原始 .lvm） */
     WCHAR szPS[MAX_PATH + 256];
     _snwprintf(szPS, MAX_PATH + 255,
         L"Mount-DiskImage -ImagePath '%ls'",
-        g_szVaultPath);
+        g_szVaultSymlink);
     szPS[MAX_PATH + 255] = 0;
 
-    WriteLog(L"VaultMount: 执行 PowerShell: %ls", szPS);
+    WriteLog(L"VaultMount: 步骤3 挂载符号链接: %ls", szPS);
     ExecPowerShell(szPS, TRUE, 30000);
 
-    /* 步骤3: 等待新盘符出现（最多 30 秒） */
+    /* 步骤4: 用 Get-DiskImage 管道查询盘符（AppHider 方法） */
     WCHAR cDrive = 0;
-    if (!WaitForDriveLetter(dwBefore, &cDrive, 30000)) {
-        WriteLog(L"VaultMount: 等待盘符超时，Mount-DiskImage 失败");
+    Sleep(2000);  /* 等待挂载稳定 */
+    GetDriveLetterForImage(g_szVaultSymlink, &cDrive);
 
-        /* 尝试用 diskpart 作为备用方案 */
-        WriteLog(L"VaultMount: 尝试 diskpart 备用方案");
-        EnsureVirtualDiskService();
-
-        WCHAR szScript[MAX_PATH];
-        GetTempPathW(MAX_PATH, szScript);
-        wcsncat(szScript, L"vaultmount.txt", MAX_PATH - wcslen(szScript) - 1);
-
-        HANDLE hFile = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
-                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            BYTE bom[2] = {0xFF, 0xFE};
-            DWORD written;
-            WriteFile(hFile, bom, 2, &written, NULL);
-            WCHAR szContent[1024];
-            _snwprintf(szContent, 1023,
-                L"select vdisk file=\"%ls\"\r\n"
-                L"attach vdisk\r\n",
-                g_szVaultPath);
-            szContent[1023] = 0;
-            WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
-                      &written, NULL);
-            CloseHandle(hFile);
-
-            WCHAR szCmd[MAX_PATH + 64];
-            _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
-            szCmd[MAX_PATH + 63] = 0;
-            DWORD exitCode = ExecHiddenEx(szCmd);
-            WriteLog(L"VaultMount: diskpart 备用退出码=%lu", exitCode);
-            DeleteFileW(szScript);
-
-            /* 再等 20 秒 */
-            if (!WaitForDriveLetter(dwBefore, &cDrive, 20000)) {
-                WriteLog(L"VaultMount: diskpart 备用也失败");
-                if (hWndParent) {
-                    WCHAR msg[768];
-                    _snwprintf(msg, 767,
-                        L"挂载失败！\r\n\r\n"
-                        L"已尝试两种方法（PowerShell + diskpart）均失败。\r\n\r\n"
-                        L"诊断信息：\r\n"
-                        L"• PowerShell Mount-DiskImage：无新盘符（30s超时）\r\n"
-                        L"• diskpart attach vdisk：无新盘符（20s超时），退出码=%lu\r\n\r\n"
-                        L"请排查：\r\n"
-                        L"1. 文件是否为有效的 VHDX 格式（用 PowerShell 验证）\r\n"
-                        L"   命令：Test-Path '%ls'\r\n"
-                        L"2. 以管理员身份运行本程序\r\n"
-                        L"3. Win+R → services.msc → Virtual Disk → 启动\r\n"
-                        L"4. 在 PowerShell(管理员) 手动测试：\r\n"
-                        L"   Mount-DiskImage -ImagePath '%ls'",
-                        exitCode, g_szVaultPath, g_szVaultPath);
-                    msg[767] = 0;
-                    MessageBoxW(hWndParent, msg, L"挂载失败！", MB_OK | MB_ICONERROR);
-                }
-                return FALSE;
-            }
-        } else {
+    /* 如果 PS 查询失败，退回等待盘符方法 */
+    if (!cDrive) {
+        WriteLog(L"VaultMount: Get-DiskImage 查询失败，尝试等待盘符出现");
+        if (!WaitForDriveLetter(dwBefore, &cDrive, 20000)) {
+            WriteLog(L"VaultMount: 等待盘符超时，挂载失败");
+            CleanupVaultSymlink();
             if (hWndParent) {
-                MessageBoxW(hWndParent,
-                    L"挂载失败！PowerShell Mount-DiskImage 无新盘符（30s超时）\r\n"
-                    L"请以管理员身份运行，并确认文件为有效 VHDX 格式。",
-                    L"挂载失败！", MB_OK | MB_ICONERROR);
+                WCHAR msg[768];
+                _snwprintf(msg, 767,
+                    L"挂载失败！\r\n\r\n"
+                    L"符号链接已创建，但 Mount-DiskImage 无法挂载。\r\n\r\n"
+                    L"请在 PowerShell(管理员)手动测试：\r\n"
+                    L"Mount-DiskImage -ImagePath '%ls'\r\n\r\n"
+                    L"如果报错，请确认：\r\n"
+                    L"1. 文件是否为有效的 VHDX 格式\r\n"
+                    L"2. 以管理员身份运行本程序\r\n"
+                    L"3. Win+R → services.msc → Virtual Disk → 启动",
+                    g_szVaultPath);
+                msg[767] = 0;
+                MessageBoxW(hWndParent, msg, L"挂载失败！", MB_OK | MB_ICONERROR);
             }
             return FALSE;
         }
     }
 
-    WriteLog(L"VaultMount: 新盘符 %lc: 已出现", cDrive);
+    WriteLog(L"VaultMount: 盘符 %lc: 已确认", cDrive);
 
-    /* 步骤4: 等待盘符稳定 */
+    /* 步骤5: 等待盘符稳定 */
     Sleep(1500);
 
-    /* 步骤5: 用 PowerShell + manage-bde 解锁 BitLocker
-     * 用 PowerShell 传递密码，避免 cmd echo 的特殊字符问题
-     * PowerShell 命令：
-     *   $pwd = ConvertTo-SecureString '密码' -AsPlainText -Force
-     *   Unlock-BitLocker -MountPoint 'X:' -Password $pwd
-     * 如果 Unlock-BitLocker 不可用（旧版），退回 manage-bde
+    /* 步骤6: 用 PowerShell Unlock-BitLocker 解锁
+     * 和 AppHider 相同的命令：
+     *   $pw = ConvertTo-SecureString '密码' -AsPlainText -Force
+     *   Unlock-BitLocker -MountPoint 'X:' -Password $pw
      */
     WCHAR szUnlockPS[1024];
     _snwprintf(szUnlockPS, 1023,
-        L"try { "
         L"$p = ConvertTo-SecureString '%ls' -AsPlainText -Force; "
-        L"Unlock-BitLocker -MountPoint '%lc:' -Password $p "
-        L"} catch { "
-        L"cmd /c 'echo %ls | manage-bde -unlock %lc: -password' "
-        L"}",
-        g_szVaultPwd, cDrive, g_szVaultPwd, cDrive);
+        L"Unlock-BitLocker -MountPoint '%lc:' -Password $p",
+        g_szVaultPwd, cDrive);
     szUnlockPS[1023] = 0;
 
-    WriteLog(L"VaultMount: 执行 BitLocker 解锁");
+    WriteLog(L"VaultMount: 步骤6 执行 BitLocker 解锁");
     ExecPowerShell(szUnlockPS, TRUE, 15000);
 
     /* 等待解锁完成 */
     Sleep(2000);
 
-    /* 步骤6: 验证盘符是否可访问 */
+    /* 步骤7: 验证盘符是否可访问 */
     WCHAR szTest[8];
     _snwprintf(szTest, 7, L"%lc:\\", cDrive);
     DWORD attrs = GetFileAttributesW(szTest);
@@ -650,15 +812,17 @@ static BOOL VaultEject(HWND hWndParent) {
     }
 
     /* 步骤2: 用 PowerShell Dismount-DiskImage 弹出
-     * 同样不依赖 diskpart，支持任意扩展名
+     * v3.3.3: 使用符号链接路径（和挂载时一致）
      */
     WCHAR szDismountPS[MAX_PATH + 256];
+    /* 优先用符号链接路径，如果没有则用原始路径 */
+    const WCHAR *pImagePath = (g_szVaultSymlink[0]) ? g_szVaultSymlink : g_szVaultPath;
     _snwprintf(szDismountPS, MAX_PATH + 255,
         L"Dismount-DiskImage -ImagePath '%ls'",
-        g_szVaultPath);
+        pImagePath);
     szDismountPS[MAX_PATH + 255] = 0;
 
-    WriteLog(L"VaultEject: 执行 PowerShell Dismount-DiskImage");
+    WriteLog(L"VaultEject: 执行 PowerShell Dismount-DiskImage [%ls]", pImagePath);
     ExecPowerShell(szDismountPS, TRUE, 15000);
 
     /* 备用：如果 PowerShell 弹出失败，用 diskpart */
@@ -677,10 +841,11 @@ static BOOL VaultEject(HWND hWndParent) {
             DWORD written;
             WriteFile(hFile, bom, 2, &written, NULL);
             WCHAR szContent[1024];
+            /* diskpart 备用也用符号链接路径 */
             _snwprintf(szContent, 1023,
                 L"select vdisk file=\"%ls\"\r\n"
                 L"detach vdisk\r\n",
-                g_szVaultPath);
+                pImagePath);
             szContent[1023] = 0;
             WriteFile(hFile, szContent, (DWORD)(wcslen(szContent) * sizeof(WCHAR)),
                       &written, NULL);
@@ -696,6 +861,9 @@ static BOOL VaultEject(HWND hWndParent) {
 
     /* 步骤3: 等待盘符消失 */
     Sleep(2000);
+
+    /* 步骤3b: 删除符号链接（AppHider CleanupSymlink） */
+    CleanupVaultSymlink();
 
     /* 步骤5: 清理文件管理器中的盘符访问记录 */
     /* 清理 Shell 文件夹历史（快速访问） */
