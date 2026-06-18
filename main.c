@@ -171,6 +171,8 @@ static WCHAR g_szAdapter[256]   = {0};
 
 /* IP守护 */
 static volatile BOOL g_bIPGuardEnabled = FALSE;
+static volatile BOOL g_bAllowIPChange = FALSE;
+static WCHAR g_szExpectedIP[64] = {0};
 
 /* 隐藏的窗口列表 */
 #define MAX_HIDDEN_WNDS 64
@@ -1554,9 +1556,6 @@ static void UnlockIPReg(void) {
         RegCloseKey(hKey);
     }
 }
-
-static volatile BOOL g_bAllowIPChange = FALSE;
-static WCHAR g_szExpectedIP[64] = {0};
 
 static BOOL AdapterHasIP(const WCHAR *expectedIP) {
     ULONG bufLen = 16384;
