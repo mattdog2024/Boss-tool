@@ -11,7 +11,14 @@
  *     3. 启动 Virtual Disk 服务检测
  *     4. 弹出时先 manage-bde -lock，再 detach vdisk
  *
- * v3.2 真正修复 ERR_NO_BUFFER_SPACE：
+ * v3.3.4 彻底修复 ERR_NO_BUFFER_SPACE + 兜底快捷键失效：
+ *   - 根因：ApplyIP 每次 add address 不删除旧IP，导致IP地址累积耗尽网络栈缓冲区
+ *   - ApplyIP 现在先 delete 所有旧IP，再 set/add 新IP，彻底消除累积
+ *   - EmergencyNetworkFix 重写：暂停 IPGuard→清除累积 IP→重置网络栈→重新应用正确 IP
+ *   - IPGuardThread 加 BeginNetworkChange/EndNetworkChange 保护
+ *   - 兜底快捷键现在能真正恢复网络（不再被 IPGuard 立即覆盖）
+ *
+ * v3.2 原始尝试（不完全）：
  *   - 重写 ApplyIP，改用 store=active
  *   - WatchdogThread Sleep 400→2000
  *   - g_bLocked / g_bBossMode 改用 InterlockedExchange
@@ -1031,17 +1038,89 @@ static void LoadVaultConfig(void) {
    v3.2: 一键修复网络栈
    ============================================================ */
 static void EmergencyNetworkFix(void) {
-    WriteLog(L"EmergencyNetworkFix: START");
-    ExecHidden(L"net stop hns");
+    WriteLog(L"EmergencyNetworkFix v3.3.4: START");
+
+    /* 步骤1: 暂停 IPGuard，防止修复期间被重新 ApplyIP 覆盖 */
+    InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 1);
+
+    const WCHAR *adpName = GetAdapterName();
+    WCHAR args[512];
+
+    /* 步骤2: 清除所有累积的 IP 地址（这才是 ERR_NO_BUFFER_SPACE 的根本解决） */
+    WriteLog(L"EmergencyNetworkFix: 清除累积 IP");
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_WORK2);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
+        adpName, IP_WORK2);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_WORK1);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_BOSS);
+    RunNetshDirect(args);
+    Sleep(500);
+
+    /* 步骤3: 重置网络栈（不需重启的部分） */
+    ExecHidden(L"netsh interface ipv4 reset");
+    Sleep(1000);
     ExecHidden(L"net stop iphlpsvc");
     ExecHidden(L"net stop nsi");
     Sleep(500);
     ExecHidden(L"net start nsi");
     ExecHidden(L"net start iphlpsvc");
-    ExecHidden(L"net start hns");
+    Sleep(1000);
+
+    /* 步骤4: 刷新 DNS 和 ARP 缓存 */
     ExecHidden(L"ipconfig /flushdns");
-    ExecHidden(L"netsh winsock reset catalog");
-    WriteLog(L"EmergencyNetworkFix: DONE");
+    ExecHidden(L"netsh interface ipv4 delete arpcache");
+    Sleep(500);
+
+    /* 步骤5: 重新应用正确的 IP（根据当前模式） */
+    WriteLog(L"EmergencyNetworkFix: 重新应用IP (bBossMode=%d)", g_bBossMode);
+    if (g_bBossMode) {
+        wcsncpy(g_szExpectedIP, IP_BOSS, 63);
+        /* 直接用 netsh，不走 ApplyIP 避免递归问题 */
+        _snwprintf(args, 511,
+            L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
+            adpName, IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW);
+        RunNetshDirect(args);
+        Sleep(1000);
+        _snwprintf(args, 511,
+            L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
+            adpName, IP_BOSS_DNS);
+        RunNetshDirect(args);
+    } else {
+        wcsncpy(g_szExpectedIP, IP_WORK1, 63);
+        _snwprintf(args, 511,
+            L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
+            adpName, IP_WORK1, IP_WORK_MASK, IP_WORK_GW);
+        RunNetshDirect(args);
+        Sleep(1000);
+        /* 添加第二 IP */
+        _snwprintf(args, 511,
+            L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
+            adpName, IP_WORK2, IP_WORK_MASK);
+        RunNetshDirect(args);
+        Sleep(300);
+        _snwprintf(args, 511,
+            L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
+            adpName, IP_WORK_DNS);
+        RunNetshDirect(args);
+    }
+
+    ExecHidden(L"ipconfig /flushdns");
+    Sleep(500);
+
+    /* 步骤6: 恢复 IPGuard */
+    InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 0);
+
+    WriteLog(L"EmergencyNetworkFix v3.3.4: DONE");
 }
 
 DWORD WINAPI EmergencyFixThread(LPVOID p) {
@@ -1376,6 +1455,31 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
     BOOL bOK = FALSE;
     DWORD ret;
 
+    /* v3.3.4 核心修复：先删除所有旧 IP 地址，防止累积导致 ERR_NO_BUFFER_SPACE
+     * 根本原因：之前每次 add address 不删除旧的，IP 地址堆积在网卡上
+     * Windows 网络栈对每个适配器有 IP 数量上限，超过后报 WSAENOBUFS (10055)
+     */
+    WriteLog(L"ApplyIP: 清除旧IP [adapter=%ls]", adpName);
+
+    /* 先删除所有非主 IP（第二、第三...IP） */
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_WORK2);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
+        adpName, IP_WORK2);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_WORK1);
+    RunNetshDirect(args);
+    _snwprintf(args, 511,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_BOSS);
+    RunNetshDirect(args);
+    Sleep(500);
+
     /* 方案A: ipv4 + name + store=active */
     _snwprintf(args, 511,
         L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
@@ -1405,6 +1509,12 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
     }
 
     if (ip2 && ip2[0]) {
+        /* 先删除可能存在的旧第二IP，再添加（防止重复累积） */
+        _snwprintf(args, 511,
+            L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+            adpName, ip2);
+        RunNetshDirect(args);
+        Sleep(200);
         _snwprintf(args, 511,
             L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, ip2, mask2);
@@ -1487,11 +1597,15 @@ DWORD WINAPI IPGuardThread(LPVOID p) {
             Sleep(15000);
             if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
             if (g_lNetworkChangeBusy || AdapterHasIP(g_szExpectedIP)) continue;
+            /* v3.3.4: 用 BeginNetworkChange 保护，防止和 EmergencyFix 冲突 */
+            if (!BeginNetworkChange()) continue;
+            WriteLog(L"IPGuardThread: IP 丢失，重新应用");
             if (g_bBossMode)
                 ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
             else
                 ApplyIP(IP_WORK1, IP_WORK_MASK, IP_WORK_GW,
                         IP_WORK_DNS, IP_WORK2, IP_WORK_MASK);
+            EndNetworkChange();
         }
     }
     return 0;
