@@ -80,15 +80,20 @@
 #define IP_BOSS_DNS     L"8.2.27.254"
 
 /* 热键ID */
-#define HOTKEY_BOSS     1001
-#define HOTKEY_SETTINGS 1002
-#define HOTKEY_NETFIX   1003
+#define HOTKEY_BOSS       1001
+#define HOTKEY_SETTINGS   1002
+#define HOTKEY_NETFIX     1003
 #define HOTKEY_NETFIX_ALT 1004
+#define HOTKEY_LOCK       1005   /* 锁屏热键 */
 
-#define EMERGENCY_MOD   (MOD_CONTROL|MOD_ALT)
-#define EMERGENCY_VK    VK_F12
+#define EMERGENCY_MOD     (MOD_CONTROL|MOD_ALT)
+#define EMERGENCY_VK      VK_F12
 #define EMERGENCY_MOD_ALT (MOD_CONTROL|MOD_SHIFT)
 #define EMERGENCY_VK_ALT  VK_F12
+
+/* 锁屏热键：Ctrl+Alt+L */
+#define LOCK_MOD          (MOD_CONTROL|MOD_ALT)
+#define LOCK_VK           'L'
 
 /* 自定义消息 */
 #define WM_LOCK_SCREEN   (WM_USER+10)
@@ -136,7 +141,7 @@ static volatile BOOL g_bBossMode = FALSE;
 static volatile BOOL g_bLocked   = FALSE;
 static volatile LONG g_lNetworkChangeBusy = 0;
 static volatile LONG g_lEmergencyFixBusy  = 0;
-static volatile BOOL g_bEnableMacRandomization = FALSE;
+static volatile BOOL g_bEnableMacRandomization = TRUE;  /* 每次切换IP时自动随机更换MAC地址 */
 
 /* 配置 */
 static WCHAR g_szLoginPwd[64]   = DEFAULT_LOGIN_PWD;
@@ -1040,77 +1045,119 @@ static void LoadVaultConfig(void) {
    v3.2: 一键修复网络栈
    ============================================================ */
 static void EmergencyNetworkFix(void) {
-    WriteLog(L"EmergencyNetworkFix v3.3.4: START");
+    /* ============================================================
+       紧急网络修复 v3.4
+       彻底解决 ERR_NO_BUFFER_SPACE：
+       参考 AppHider EmergencyRestoreAsync 的多步骤恢复策略
+       ============================================================ */
 
-    /* 步骤1: 暂停 IPGuard，防止修复期间被重新 ApplyIP 覆盖 */
+    /* 步骤0: 锁定，防止 IPGuard 并发干扰 */
     InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 1);
 
     const WCHAR *adpName = GetAdapterName();
-    WCHAR args[512];
+    WCHAR args[1024];
 
-    /* 步骤2: 清除所有累积的 IP 地址（这才是 ERR_NO_BUFFER_SPACE 的根本解决） */
-    WriteLog(L"EmergencyNetworkFix: 清除累积 IP");
-    _snwprintf(args, 511,
+    /* ----------------------------------------------------------
+       步骤1: 清除防火墙规则（防止之前的操作留下阻断规则）
+       ---------------------------------------------------------- */
+    ExecHidden(L"netsh advfirewall firewall delete rule name=\"AppHider_Privacy_Block_Out\"");
+    ExecHidden(L"netsh advfirewall firewall delete rule name=\"AppHider_Privacy_Block_In\"");
+    ExecHidden(L"netsh advfirewall firewall delete rule name=\"BossTool_Block_Out\"");
+    ExecHidden(L"netsh advfirewall firewall delete rule name=\"BossTool_Block_In\"");
+
+    /* ----------------------------------------------------------
+       步骤2: 通过 WMI 强制启用所有物理网卡
+       （ERR_NO_BUFFER_SPACE 有时是网卡处于半禁用状态导致的）
+       ---------------------------------------------------------- */
+    ExecHidden(L"wmic nic where \"NetConnectionID is not null\" call enable");
+    Sleep(1500);
+
+    /* ----------------------------------------------------------
+       步骤3: 清除所有累积的 IP 地址
+       （这是 ERR_NO_BUFFER_SPACE 的核心原因：
+        多次 set address 会叠加 IP，耗尽 TCP/IP 缓冲区）
+       ---------------------------------------------------------- */
+    _snwprintf(args, 1023,
         L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
         adpName, IP_WORK2);
     RunNetshDirect(args);
-    _snwprintf(args, 511,
+    _snwprintf(args, 1023,
         L"interface ipv4 delete address name=\"%ls\" addr=%ls",
         adpName, IP_WORK2);
     RunNetshDirect(args);
-    _snwprintf(args, 511,
+    _snwprintf(args, 1023,
         L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
         adpName, IP_WORK1);
     RunNetshDirect(args);
-    _snwprintf(args, 511,
+    _snwprintf(args, 1023,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
+        adpName, IP_WORK1);
+    RunNetshDirect(args);
+    _snwprintf(args, 1023,
         L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+        adpName, IP_BOSS);
+    RunNetshDirect(args);
+    _snwprintf(args, 1023,
+        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
         adpName, IP_BOSS);
     RunNetshDirect(args);
     Sleep(500);
 
-    /* 步骤3: 重置网络栈（不需重启的部分） */
-    ExecHidden(L"netsh interface ipv4 reset");
-    Sleep(1000);
+    /* ----------------------------------------------------------
+       步骤4: 重置 TCP/IP 协议栈 + 重启网络核心服务
+       ---------------------------------------------------------- */
+    RunNetshDirect(L"interface ipv4 reset");
+    RunNetshDirect(L"winsock reset");   /* 重置 Winsock，清除 socket 缓冲区 */
+    Sleep(800);
     ExecHidden(L"net stop iphlpsvc");
     ExecHidden(L"net stop nsi");
-    Sleep(500);
+    Sleep(600);
     ExecHidden(L"net start nsi");
     ExecHidden(L"net start iphlpsvc");
     Sleep(1000);
 
-    /* 步骤4: 刷新 DNS 和 ARP 缓存 */
+    /* ----------------------------------------------------------
+       步骤5: 确保 DNS Client 服务运行
+       ---------------------------------------------------------- */
+    ExecHidden(L"net start Dnscache");
+    Sleep(300);
+
+    /* ----------------------------------------------------------
+       步骤6: 刷新 DNS / ARP / 路由缓存
+       ---------------------------------------------------------- */
     ExecHidden(L"ipconfig /flushdns");
-    ExecHidden(L"netsh interface ipv4 delete arpcache");
+    RunNetshDirect(L"interface ipv4 delete arpcache");
+    RunNetshDirect(L"interface ipv4 delete destinationcache");
+    ExecHidden(L"route flush");
     Sleep(500);
 
-    /* 步骤5: 重新应用正确的 IP（根据当前模式） */
-    WriteLog(L"EmergencyNetworkFix: 重新应用IP (bBossMode=%d)", g_bBossMode);
+    /* ----------------------------------------------------------
+       步骤7: 重新应用正确的 IP（根据当前模式）
+       ---------------------------------------------------------- */
     if (g_bBossMode) {
         wcsncpy(g_szExpectedIP, IP_BOSS, 63);
-        /* 直接用 netsh，不走 ApplyIP 避免递归问题 */
-        _snwprintf(args, 511,
+        _snwprintf(args, 1023,
             L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
             adpName, IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW);
         RunNetshDirect(args);
-        Sleep(1000);
-        _snwprintf(args, 511,
+        Sleep(800);
+        _snwprintf(args, 1023,
             L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
             adpName, IP_BOSS_DNS);
         RunNetshDirect(args);
     } else {
         wcsncpy(g_szExpectedIP, IP_WORK1, 63);
-        _snwprintf(args, 511,
+        _snwprintf(args, 1023,
             L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
             adpName, IP_WORK1, IP_WORK_MASK, IP_WORK_GW);
         RunNetshDirect(args);
-        Sleep(1000);
-        /* 添加第二 IP */
-        _snwprintf(args, 511,
+        Sleep(800);
+        _snwprintf(args, 1023,
             L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, IP_WORK2, IP_WORK_MASK);
         RunNetshDirect(args);
         Sleep(300);
-        _snwprintf(args, 511,
+        _snwprintf(args, 1023,
             L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
             adpName, IP_WORK_DNS);
         RunNetshDirect(args);
@@ -1119,10 +1166,8 @@ static void EmergencyNetworkFix(void) {
     ExecHidden(L"ipconfig /flushdns");
     Sleep(500);
 
-    /* 步骤6: 恢复 IPGuard */
+    /* 步骤8: 恢复 IPGuard */
     InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 0);
-
-    WriteLog(L"EmergencyNetworkFix v3.3.4: DONE");
 }
 
 DWORD WINAPI EmergencyFixThread(LPVOID p) {
@@ -1888,6 +1933,7 @@ static void RegisterHotkeys(HWND hWnd) {
     UnregisterHotKey(hWnd, HOTKEY_SETTINGS);
     UnregisterHotKey(hWnd, HOTKEY_NETFIX);
     UnregisterHotKey(hWnd, HOTKEY_NETFIX_ALT);
+    UnregisterHotKey(hWnd, HOTKEY_LOCK);
     if (!RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk))
         WriteLog(L"RegisterHotKey BOSS failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_SETTINGS, SETTINGS_MOD, SETTINGS_VK))
@@ -1896,6 +1942,8 @@ static void RegisterHotkeys(HWND hWnd) {
         WriteLog(L"RegisterHotKey NETFIX failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_NETFIX_ALT, EMERGENCY_MOD_ALT, EMERGENCY_VK_ALT))
         WriteLog(L"RegisterHotKey NETFIX_ALT failed err=%lu", GetLastError());
+    if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, LOCK_VK))
+        WriteLog(L"RegisterHotKey LOCK failed err=%lu", GetLastError());
 }
 
 /* ============================================================
@@ -2735,6 +2783,8 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShowLoginDialog();
         } else if(wParam==HOTKEY_NETFIX || wParam==HOTKEY_NETFIX_ALT) {
             StartDetachedThread(EmergencyFixThread, NULL);
+        } else if(wParam==HOTKEY_LOCK) {
+            PostMessageW(hWnd, WM_LOCK_SCREEN, 0, 0);
         }
         break;
     case WM_LOCK_SCREEN:
