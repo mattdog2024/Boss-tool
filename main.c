@@ -221,6 +221,7 @@ static BOOL  VaultMount(HWND hWndParent);
 static BOOL  VaultEject(HWND hWndParent);
 static void  VaultAutoMount(void);
 static void  VaultAutoEject(void);
+static void  VaultRecoverAndEject(void);  /* v3.5: 启动时卸载旧版遗留的VHDX */
 static void  SaveVaultConfig(void);
 static void  LoadVaultConfig(void);
 static WCHAR FindNewDriveLetter(DWORD dwBefore);
@@ -970,6 +971,123 @@ static void VaultAutoMount(void) {
 static void VaultAutoEject(void) {
     if (!g_bVaultMounted) return;
     VaultEject(NULL);
+}
+
+/* ============================================================
+   v3.5: 启动时恢复旧版遗留的VHDX挂载状态并强制卸载
+   解决：更换版本后旧版挂载的VHDX无法卸载的问题
+   ============================================================ */
+static void VaultRecoverAndEject(void) {
+    /* 如果当前已知挂载状态，直接卸载 */
+    if (g_bVaultMounted) {
+        VaultEject(NULL);
+        return;
+    }
+
+    /* 用 PowerShell 扫描所有已挂载的磁盘镜像 */
+    /* 把结果写到临时文件，再读取 */
+    WCHAR szTmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, szTmp);
+    wcsncat(szTmp, L"BossVaultScan.txt", MAX_PATH - wcslen(szTmp) - 1);
+    DeleteFileW(szTmp);
+
+    WCHAR szPS[MAX_PATH + 256];
+    _snwprintf(szPS, MAX_PATH + 255,
+        L"Get-DiskImage | Where-Object {$_.Attached -eq $true} | "
+        L"Select-Object -ExpandProperty ImagePath | "
+        L"Out-File -FilePath '%ls' -Encoding UTF8",
+        szTmp);
+    szPS[MAX_PATH + 255] = 0;
+    ExecPowerShell(szPS, TRUE, 10000);
+
+    /* 读取扫描结果 */
+    HANDLE hFile = CreateFileW(szTmp, GENERIC_READ, FILE_SHARE_READ,
+                               NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    DWORD dwSize = GetFileSize(hFile, NULL);
+    if (dwSize == 0 || dwSize > 65535) { CloseHandle(hFile); DeleteFileW(szTmp); return; }
+
+    char *buf = (char*)HeapAlloc(GetProcessHeap(), 0, dwSize + 4);
+    if (!buf) { CloseHandle(hFile); DeleteFileW(szTmp); return; }
+    DWORD dwRead = 0;
+    ReadFile(hFile, buf, dwSize, &dwRead, NULL);
+    buf[dwRead] = 0;
+    CloseHandle(hFile);
+    DeleteFileW(szTmp);
+
+    /* 转换为宽字符并逐行检查 */
+    /* 跳过 UTF-8 BOM */
+    char *p = buf;
+    if (dwRead >= 3 && (BYTE)p[0]==0xEF && (BYTE)p[1]==0xBB && (BYTE)p[2]==0xBF) p += 3;
+
+    /* 逐行处理 */
+    while (*p) {
+        /* 跳过空白 */
+        while (*p == '\r' || *p == '\n' || *p == ' ') p++;
+        if (!*p) break;
+
+        /* 找到行尾 */
+        char *lineStart = p;
+        while (*p && *p != '\r' && *p != '\n') p++;
+        int lineLen = (int)(p - lineStart);
+        if (lineLen <= 0) continue;
+
+        /* 转宽字符 */
+        WCHAR szLine[MAX_PATH] = {0};
+        MultiByteToWideChar(CP_UTF8, 0, lineStart, lineLen, szLine, MAX_PATH - 1);
+
+        /* 检查是否包含 BossVault_ 或匹配 g_szVaultPath */
+        BOOL bMatch = FALSE;
+        if (wcsstr(szLine, L"BossVault_") != NULL) bMatch = TRUE;
+        if (g_szVaultPath[0] && _wcsicmp(szLine, g_szVaultPath) == 0) bMatch = TRUE;
+        /* 也检查不带扩展名的基本文件名 */
+        if (!bMatch && g_szVaultPath[0]) {
+            WCHAR *pBase = wcsrchr(g_szVaultPath, L'\\');
+            if (pBase) {
+                pBase++;
+                if (wcsstr(szLine, pBase) != NULL) bMatch = TRUE;
+            }
+        }
+
+        if (bMatch) {
+            /* 找到遗留挂载，强制卸载 */
+            WCHAR szDismount[MAX_PATH + 128];
+            _snwprintf(szDismount, MAX_PATH + 127,
+                L"Dismount-DiskImage -ImagePath '%ls'", szLine);
+            szDismount[MAX_PATH + 127] = 0;
+            ExecPowerShell(szDismount, TRUE, 15000);
+            Sleep(1000);
+
+            /* diskpart 备用 */
+            WCHAR szScript[MAX_PATH];
+            GetTempPathW(MAX_PATH, szScript);
+            wcsncat(szScript, L"vaultrecover.txt", MAX_PATH - wcslen(szScript) - 1);
+            HANDLE hScr = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hScr != INVALID_HANDLE_VALUE) {
+                BYTE bom[2] = {0xFF, 0xFE};
+                DWORD wr;
+                WriteFile(hScr, bom, 2, &wr, NULL);
+                WCHAR szDp[MAX_PATH + 64];
+                _snwprintf(szDp, MAX_PATH + 63,
+                    L"select vdisk file=\"%ls\"\r\ndetach vdisk\r\n", szLine);
+                WriteFile(hScr, szDp, (DWORD)(wcslen(szDp)*sizeof(WCHAR)), &wr, NULL);
+                CloseHandle(hScr);
+                WCHAR szCmd[MAX_PATH + 64];
+                _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
+                ExecHiddenEx(szCmd);
+                DeleteFileW(szScript);
+            }
+
+            /* 清理临时符号链接（BossVault_*.vhdx） */
+            if (wcsstr(szLine, L"BossVault_") != NULL) {
+                DeleteFileW(szLine);
+            }
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, buf);
 }
 
 /* ============================================================
@@ -1971,6 +2089,8 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
+    /* v3.5: 启动时扫描并卸载旧版遗留的VHDX（更换版本后第一次运行） */
+    VaultRecoverAndEject();
     SetIPWork();
     return 0;
 }
