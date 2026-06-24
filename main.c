@@ -1,5 +1,5 @@
 /*
- * BossTool v4.0 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.1 - Windows 7/8/10/11 隱形管理工具
  *
  * v3.3 新增：隐私保险箱（VHDX/BitLocker 伪装文件挂载）
  *   - 支持选择 .lvm（实为 .vhdx）伪装文件
@@ -984,7 +984,40 @@ static void VaultRecoverAndEject(void) {
         return;
     }
 
-    /* 用 PowerShell 扫描所有已挂载的磁盘镜像 */
+    /* v4.1: 如果已知保险箱路径，直接尝试卸载（不管扫描是否成功）
+     * 这样即使 Get-DiskImage 失败（PowerShell 执行策略问题），也能卸载 */
+    if (g_szVaultPath[0]) {
+        /* 先用 diskpart 直接尝试 detach */
+        WCHAR szScript[MAX_PATH];
+        GetTempPathW(MAX_PATH, szScript);
+        wcsncat(szScript, L"vaultdirect.txt", MAX_PATH - wcslen(szScript) - 1);
+        HANDLE hScr = CreateFileW(szScript, GENERIC_WRITE, 0, NULL,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hScr != INVALID_HANDLE_VALUE) {
+            BYTE bom[2] = {0xFF, 0xFE};
+            DWORD wr;
+            WriteFile(hScr, bom, 2, &wr, NULL);
+            WCHAR szDp[MAX_PATH + 64];
+            _snwprintf(szDp, MAX_PATH + 63,
+                L"select vdisk file=\"%ls\"\r\ndetach vdisk\r\n", g_szVaultPath);
+            WriteFile(hScr, szDp, (DWORD)(wcslen(szDp)*sizeof(WCHAR)), &wr, NULL);
+            CloseHandle(hScr);
+            WCHAR szCmd[MAX_PATH + 64];
+            _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
+            ExecHiddenEx(szCmd);
+            Sleep(2000);
+            DeleteFileW(szScript);
+        }
+        /* 也尝试 PowerShell Dismount */
+        WCHAR szDismount[MAX_PATH + 128];
+        _snwprintf(szDismount, MAX_PATH + 127,
+            L"Dismount-DiskImage -ImagePath '%ls' -ErrorAction SilentlyContinue",
+            g_szVaultPath);
+        szDismount[MAX_PATH + 127] = 0;
+        ExecPowerShell(szDismount, TRUE, 10000);
+    }
+
+    /* 用 PowerShell 扫描所有已挂载的磁盘镜像（备用方案，处理未知路径的情况） */
     /* 把结果写到临时文件，再读取 */
     WCHAR szTmp[MAX_PATH];
     GetTempPathW(MAX_PATH, szTmp);
@@ -2040,6 +2073,23 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
+
+    /* v4.1: 禁用系统 Win+L 锁屏（组策略）
+     * 这样 Win+L 不会触发 Windows 自带锁屏，而是被我们的键盘钩子拦截
+     * 显示 Ubuntu 伪装界面。
+     * 注册表路径: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
+     * 值: DisableLockWorkstation = 1 */
+    {
+        HKEY hKey;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD val = 1;
+            RegSetValueExW(hKey, L"DisableLockWorkstation", 0, REG_DWORD, (LPBYTE)&val, sizeof(val));
+            RegCloseKey(hKey);
+        }
+    }
+
     /* v3.5: 启动时扫描并卸载旧版遗留的VHDX（更换版本后第一次运行） */
     VaultRecoverAndEject();
     SetIPWork();
@@ -2069,6 +2119,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     BOOL bAlt  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
     BOOL bWin  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
                  (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
+
+    /* v4.1: 拦截 Win+L，触发我们的 Ubuntu 伪装锁屏（而不是 Windows 自带锁屏） */
+    if (!g_bLocked && bDown && bWin && vk == 'L') {
+        /* 吃掉 Win+L，不传递给系统 */
+        PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
+        return 1;
+    }
 
     if (g_bLocked) {
         if (g_hWndLock && IsWindow(g_hWndLock)) {
