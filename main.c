@@ -1,5 +1,5 @@
 /*
- * BossTool v3.3 - Windows 7/8/10/11 隐形管理工具
+ * BossTool v4.0 - Windows 7/8/10/11 隱形管理工具
  *
  * v3.3 新增：隐私保险箱（VHDX/BitLocker 伪装文件挂载）
  *   - 支持选择 .lvm（实为 .vhdx）伪装文件
@@ -1164,93 +1164,53 @@ static void LoadVaultConfig(void) {
    ============================================================ */
 static void EmergencyNetworkFix(void) {
     /* ============================================================
-       紧急网络修复 v3.4
-       彻底解决 ERR_NO_BUFFER_SPACE：
-       参考 AppHider EmergencyRestoreAsync 的多步骤恢复策略
+       紧急网络修复 v4.0
+       核心原则：绝不执行需要重启才能生效的命令！
+       禁止：ipv4 reset / winsock reset / route flush /
+             delete arpcache / delete destinationcache / delete address
+       这些命令在不重启的情况下会让网络栈进入不一致状态，
+       反而加重 ERR_NO_BUFFER_SPACE。
+
+       正确策略（参考 AppHider EmergencyRestoreAsync）：
+       1. 禁用再启用网卡（硬重置，清空所有连接状态）
+       2. 重新设置IP（用 set 覆盖，不 delete）
+       3. 确保DNS服务运行
        ============================================================ */
 
-    /* 步骤0: 锁定，防止 IPGuard 并发干扰 */
+    /* 步骤0: 强制锁定，不等待（紧急修复优先级最高） */
     InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 1);
 
     const WCHAR *adpName = GetAdapterName();
     WCHAR args[1024];
 
     /* ----------------------------------------------------------
-       步骤1: 清除防火墙规则（防止之前的操作留下阻断规则）
-       ---------------------------------------------------------- */
-    ExecHidden(L"netsh advfirewall firewall delete rule name=\"AppHider_Privacy_Block_Out\"");
-    ExecHidden(L"netsh advfirewall firewall delete rule name=\"AppHider_Privacy_Block_In\"");
-    ExecHidden(L"netsh advfirewall firewall delete rule name=\"BossTool_Block_Out\"");
-    ExecHidden(L"netsh advfirewall firewall delete rule name=\"BossTool_Block_In\"");
-
-    /* ----------------------------------------------------------
-       步骤2: 通过 WMI 强制启用所有物理网卡
-       （ERR_NO_BUFFER_SPACE 有时是网卡处于半禁用状态导致的）
-       ---------------------------------------------------------- */
-    ExecHidden(L"wmic nic where \"NetConnectionID is not null\" call enable");
-    Sleep(1500);
-
-    /* ----------------------------------------------------------
-       步骤3: 清除所有累积的 IP 地址
-       （这是 ERR_NO_BUFFER_SPACE 的核心原因：
-        多次 set address 会叠加 IP，耗尽 TCP/IP 缓冲区）
+       步骤1: 禁用网卡（硬重置所有TCP/UDP连接和缓冲区）
+       这是解决 ERR_NO_BUFFER_SPACE 最有效的方法：
+       禁用网卡会让 Windows 立即释放该网卡上所有的
+       socket缓冲区、连接状态、非分页池内存。
        ---------------------------------------------------------- */
     _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_WORK2);
+        L"interface set interface name=\"%ls\" admin=disabled",
+        adpName);
     RunNetshDirect(args);
-    _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
-        adpName, IP_WORK2);
-    RunNetshDirect(args);
-    _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_WORK1);
-    RunNetshDirect(args);
-    _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
-        adpName, IP_WORK1);
-    RunNetshDirect(args);
-    _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_BOSS);
-    RunNetshDirect(args);
-    _snwprintf(args, 1023,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
-        adpName, IP_BOSS);
-    RunNetshDirect(args);
-    Sleep(500);
+    Sleep(2000);
 
     /* ----------------------------------------------------------
-       步骤4: 重置 TCP/IP 协议栈 + 重启网络核心服务
+       步骤2: 启用网卡（网卡重新初始化，缓冲区全部清空）
        ---------------------------------------------------------- */
-    RunNetshDirect(L"interface ipv4 reset");
-    RunNetshDirect(L"winsock reset");   /* 重置 Winsock，清除 socket 缓冲区 */
-    Sleep(800);
-    ExecHidden(L"net stop iphlpsvc");
-    ExecHidden(L"net stop nsi");
-    Sleep(600);
-    ExecHidden(L"net start nsi");
-    ExecHidden(L"net start iphlpsvc");
-    Sleep(1000);
+    _snwprintf(args, 1023,
+        L"interface set interface name=\"%ls\" admin=enabled",
+        adpName);
+    RunNetshDirect(args);
+    Sleep(3000);  /* 等待网卡完全就绪 */
 
     /* ----------------------------------------------------------
-       步骤5: 确保 DNS Client 服务运行
+       步骤3: 确保 DNS Client 服务运行
        ---------------------------------------------------------- */
     ExecHidden(L"net start Dnscache");
-    Sleep(300);
 
     /* ----------------------------------------------------------
-       步骤6: 刷新 DNS / ARP / 路由缓存
-       ---------------------------------------------------------- */
-    ExecHidden(L"ipconfig /flushdns");
-    RunNetshDirect(L"interface ipv4 delete arpcache");
-    RunNetshDirect(L"interface ipv4 delete destinationcache");
-    ExecHidden(L"route flush");
-    Sleep(500);
-
-    /* ----------------------------------------------------------
-       步骤7: 重新应用正确的 IP（根据当前模式）
+       步骤4: 重新应用正确的 IP（用 set 覆盖，不 delete）
        ---------------------------------------------------------- */
     if (g_bBossMode) {
         wcsncpy(g_szExpectedIP, IP_BOSS, 63);
@@ -1258,7 +1218,7 @@ static void EmergencyNetworkFix(void) {
             L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
             adpName, IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW);
         RunNetshDirect(args);
-        Sleep(800);
+        Sleep(500);
         _snwprintf(args, 1023,
             L"interface ipv4 set dnsservers name=\"%ls\" source=static address=%ls register=none validate=no store=active",
             adpName, IP_BOSS_DNS);
@@ -1269,7 +1229,7 @@ static void EmergencyNetworkFix(void) {
             L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
             adpName, IP_WORK1, IP_WORK_MASK, IP_WORK_GW);
         RunNetshDirect(args);
-        Sleep(800);
+        Sleep(500);
         _snwprintf(args, 1023,
             L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, IP_WORK2, IP_WORK_MASK);
@@ -1284,7 +1244,7 @@ static void EmergencyNetworkFix(void) {
     ExecHidden(L"ipconfig /flushdns");
     Sleep(500);
 
-    /* 步骤8: 恢复 IPGuard */
+    /* 步骤5: 恢复 IPGuard */
     InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 0);
 }
 
@@ -1571,18 +1531,23 @@ static void RandomizeMac(void) {
 
     if (!bSet) return;
 
+    /* v4.0: 用 netsh 禁用/启用网卡（不经过 cmd.exe，避免引号被吃掉）
+     * 之前用 wmic 通过 ExecHidden(cmd.exe /c wmic ... "Name='xxx'") 时，
+     * cmd.exe 会把内层引号吃掉，导致 wmic 收到残缺命令。
+     * 改用 RunNetshDirect 直接调用 netsh.exe（CreateProcess，不经过 cmd.exe）
+     */
     const WCHAR *adpName = GetAdapterName();
-    WCHAR cmd[512];
-    _snwprintf(cmd, 511,
-        L"wmic path win32_networkadapter where \"Name='%ls'\" call disable",
+    WCHAR args[512];
+    _snwprintf(args, 511,
+        L"interface set interface name=\"%ls\" admin=disabled",
         adpName);
-    ExecHidden(cmd);
+    RunNetshDirect(args);
+    Sleep(1500);
+    _snwprintf(args, 511,
+        L"interface set interface name=\"%ls\" admin=enabled",
+        adpName);
+    RunNetshDirect(args);
     Sleep(2000);
-    _snwprintf(cmd, 511,
-        L"wmic path win32_networkadapter where \"Name='%ls'\" call enable",
-        adpName);
-    ExecHidden(cmd);
-    Sleep(3000);
 }
 
 /* netsh 直接调用 */
@@ -1620,71 +1585,53 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
     BOOL bOK = FALSE;
     DWORD ret;
 
-    /* v3.3.4 核心修复：先删除所有旧 IP 地址，防止累积导致 ERR_NO_BUFFER_SPACE
-     * 根本原因：之前每次 add address 不删除旧的，IP 地址堆积在网卡上
-     * Windows 网络栈对每个适配器有 IP 数量上限，超过后报 WSAENOBUFS (10055)
+    /* v4.0 修复：不再 delete 旧IP！
+     * delete address 会触发 Windows 释放所有绑定到该IP的socket，
+     * 当有大量长连接时（浏览器几十个标签页），释放过程耗尽非分页池
+     * → ERR_NO_BUFFER_SPACE (WSAENOBUFS 10055)
+     *
+     * 正确做法：直接用 set address 覆盖，Windows 会原子替换旧IP，
+     * 不触发大规模socket释放。
      */
-    WriteLog(L"ApplyIP: 清除旧IP [adapter=%ls]", adpName);
+    WriteLog(L"ApplyIP: [adapter=%ls] ip=%ls", adpName, ip1);
 
-    /* 先删除所有非主 IP（第二、第三...IP） */
-    _snwprintf(args, 511,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_WORK2);
-    RunNetshDirect(args);
-    _snwprintf(args, 511,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls",
-        adpName, IP_WORK2);
-    RunNetshDirect(args);
-    _snwprintf(args, 511,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_WORK1);
-    RunNetshDirect(args);
-    _snwprintf(args, 511,
-        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-        adpName, IP_BOSS);
-    RunNetshDirect(args);
-    Sleep(500);
-
-    /* 方案A: ipv4 + name + store=active */
+    /* 方案A: ipv4 set address 直接覆盖（不delete） */
     _snwprintf(args, 511,
         L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
         adpName, ip1, mask1, gw);
     ret = RunNetshDirect(args);
-    Sleep(1000);
+    Sleep(300);
     WriteLog(L"ApplyIP A ret=%lu", ret);
     if (ret == 0) bOK = TRUE;
 
     if (!bOK) {
+        /* 方案B: 不带 store=active */
         _snwprintf(args, 511,
             L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls",
             adpName, ip1, mask1, gw);
         ret = RunNetshDirect(args);
-        Sleep(1000);
+        Sleep(300);
         WriteLog(L"ApplyIP B ret=%lu", ret);
         if (ret == 0) bOK = TRUE;
     }
 
     if (!bOK && ifIdx > 0) {
+        /* 方案C: 用接口索引 */
         _snwprintf(args, 511,
             L"interface ip set address %lu static %ls %ls %ls 1",
             ifIdx, ip1, mask1, gw);
         ret = RunNetshDirect(args);
-        Sleep(1000);
+        Sleep(300);
         WriteLog(L"ApplyIP C ret=%lu", ret);
     }
 
+    /* 第二IP：先尝试add，如果已存在会失败（无害） */
     if (ip2 && ip2[0]) {
-        /* 先删除可能存在的旧第二IP，再添加（防止重复累积） */
-        _snwprintf(args, 511,
-            L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
-            adpName, ip2);
-        RunNetshDirect(args);
-        Sleep(200);
         _snwprintf(args, 511,
             L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, ip2, mask2);
         RunNetshDirect(args);
-        Sleep(300);
+        Sleep(200);
     }
 
     if (dns && dns[0]) {
@@ -2060,8 +2007,12 @@ static void RegisterHotkeys(HWND hWnd) {
         WriteLog(L"RegisterHotKey NETFIX failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_NETFIX_ALT, EMERGENCY_MOD_ALT, EMERGENCY_VK_ALT))
         WriteLog(L"RegisterHotKey NETFIX_ALT failed err=%lu", GetLastError());
-    if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, LOCK_VK))
-        WriteLog(L"RegisterHotKey LOCK failed err=%lu", GetLastError());
+    if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, LOCK_VK)) {
+        WriteLog(L"RegisterHotKey LOCK (Ctrl+Alt+L) failed err=%lu, trying Ctrl+Alt+K", GetLastError());
+        /* Ctrl+Alt+L 可能被系统或其他程序占用，尝试备用键 */
+        if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, 'K'))
+            WriteLog(L"RegisterHotKey LOCK (Ctrl+Alt+K) also failed err=%lu", GetLastError());
+    }
 }
 
 /* ============================================================
