@@ -737,6 +737,20 @@ static BOOL VaultMount(HWND hWndParent) {
                         L"错误", MB_OK | MB_ICONERROR);
         return FALSE;
     }
+
+    /* v4.2 (P0): 防御性检查 — 理论上 LoadVaultConfig 已经验过，
+       但如果路径在运行时被改过（如别的进程写注册表），再拦一遍 */
+    {
+        WCHAR errBuf[256] = {0};
+        if (!IsValidVaultPath(g_szVaultPath, errBuf, 256)) {
+            if (hWndParent)
+                MessageBoxW(hWndParent,
+                    L"保险箱路径未通过安全检查，拒绝挂载。\r\n\r\n请到【系统设置】中重新设置。",
+                    L"路径不安全", MB_OK | MB_ICONERROR);
+            return FALSE;
+        }
+    }
+
     if (!g_szVaultPwd[0]) {
         if (hWndParent)
             MessageBoxW(hWndParent, L"请先设置 BitLocker 密码！",
@@ -1223,6 +1237,11 @@ static void VaultRecoverAndEject(void) {
 /* 迁移标志：1 = 检测到旧格式密码，已清除，请用户去设置里重设 */
 static BOOL g_bPasswordMigrationNeeded = FALSE;
 
+/* 保险箱路径不合法标志：1 = LoadVaultConfig 发现 g_szVaultPath 含有
+   shell 元字符 / 不在 C:\Users\ 下 / 后缀不是 .vhdx。保险箱拒绝挂载。 */
+static BOOL g_bVaultPathInvalid = FALSE;
+static WCHAR g_szVaultPathError[256] = {0};
+
 /* DPAPI blob 前缀 magic（4 字节 ASCII） */
 static const BYTE DPAPI_MAGIC[4] = { 'D', 'P', 'K', '1' };
 
@@ -1411,6 +1430,91 @@ static void DetectLegacyPasswordsAndMigrate(HKEY hKey) {
     }
 }
 
+/* ============================================================
+   v4.2 (P0): 保险箱路径校验
+   g_szVaultPath 可以来自：
+     1. LoadVaultConfig 从注册表读出来（首次迁移后可能含不可信数据）
+     2. SetSettingsDialog 由用户输入
+   两种都可能含 shell 元字符。以下检查双重防御：
+     a. 拒绝任何含 ' " ` ; | & $ ( ) { } < > 的路径（任何 PS / cmd 元字符）
+     b. 必须在 C:\Users\ 下（防 path traversal 跳出个人目录）
+     c. 必须以 .vhdx 结尾（VHDX 是唯一合法格式）
+   校验失败 → 清空路径，调用方应拒绝挂载并提示用户。
+   ============================================================ */
+static BOOL IsValidVaultPath(const WCHAR *path, WCHAR *errMsg, int errMsgChars) {
+    if (!path || !path[0]) {
+        if (errMsg && errMsgChars > 0) {
+            wcsncpy(errMsg, L"路径为空", errMsgChars - 1);
+            errMsg[errMsgChars - 1] = 0;
+        }
+        return FALSE;
+    }
+
+    /* a) 禁止的字符（shell / PowerShell 元字符） */
+    static const WCHAR *forbidden = L"'\"`;|$&(){}<>";
+    for (const WCHAR *p = path; *p; p++) {
+        if (wcschr(forbidden, *p) != NULL) {
+            if (errMsg && errMsgChars > 0) {
+                _snwprintf(errMsg, errMsgChars - 1,
+                    L"路径含非法字符: '%lc'（0x%04X）", *p, (UINT)*p);
+                errMsg[errMsgChars - 1] = 0;
+            }
+            return FALSE;
+        }
+    }
+    /* 控制字符也拒绝（换行 / Tab / 等）—— 避免注入跨行的 PS 命令 */
+    for (const WCHAR *p = path; *p; p++) {
+        if (*p < 0x20) {
+            if (errMsg && errMsgChars > 0) {
+                _snwprintf(errMsg, errMsgChars - 1,
+                    L"路径含控制字符 0x%02X", (UINT)*p);
+                errMsg[errMsgChars - 1] = 0;
+            }
+            return FALSE;
+        }
+    }
+
+    /* b) 必须在 C:\Users\ 下（不区分大小写） */
+    /* 最少 9 字符: C:\Users\X */
+    int len = (int)wcslen(path);
+    if (len < 9) {
+        if (errMsg && errMsgChars > 0) {
+            wcsncpy(errMsg, L"路径太短", errMsgChars - 1);
+            errMsg[errMsgChars - 1] = 0;
+        }
+        return FALSE;
+    }
+    /* C:\Users\ 前缀（大小写不敏感） */
+    if (_wcsnicmp(path, L"C:\\Users\\", 9) != 0) {
+        if (errMsg && errMsgChars > 0) {
+            wcsncpy(errMsg, L"路径必须在 C:\\Users\\ 下", errMsgChars - 1);
+            errMsg[errMsgChars - 1] = 0;
+        }
+        return FALSE;
+    }
+
+    /* c) .vhdx 后缀 */
+    static const WCHAR *suffix = L".vhdx";
+    int sufLen = (int)wcslen(suffix);
+    if (len < sufLen) {
+        if (errMsg && errMsgChars > 0) {
+            wcsncpy(errMsg, L"文件后缀必须为 .vhdx", errMsgChars - 1);
+            errMsg[errMsgChars - 1] = 0;
+        }
+        return FALSE;
+    }
+    if (_wcsicmp(path + len - sufLen, suffix) != 0) {
+        if (errMsg && errMsgChars > 0) {
+            wcsncpy(errMsg, L"文件后缀必须为 .vhdx", errMsgChars - 1);
+            errMsg[errMsgChars - 1] = 0;
+        }
+        return FALSE;
+    }
+
+    if (errMsg && errMsgChars > 0) errMsg[0] = 0;
+    return TRUE;
+}
+
 static void SaveVaultConfig(void) {
     HKEY hKey;
     DWORD dwDisp;
@@ -1464,6 +1568,20 @@ static void LoadVaultConfig(void) {
 
             RegCloseKey(hKey);
             break;
+        }
+    }
+
+    /* v4.2 (P0): 加载后立即校验路径，不合法则清空并标记 */
+    g_bVaultPathInvalid = FALSE;
+    g_szVaultPathError[0] = 0;
+    if (g_szVaultPath[0]) {
+        WCHAR errBuf[256] = {0};
+        if (!IsValidVaultPath(g_szVaultPath, errBuf, 256)) {
+            WriteLog(L"LoadVaultConfig: 路径校验失败，清空: %ls", errBuf);
+            wcsncpy(g_szVaultPathError, errBuf, 255);
+            g_szVaultPathError[255] = 0;
+            g_szVaultPath[0] = 0;
+            g_bVaultPathInvalid = TRUE;
         }
     }
 }
@@ -3114,6 +3232,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             GetDlgItemTextW(hWnd, IDC_VAULT_PATH, g_szVaultPath, MAX_PATH-1);
             GetDlgItemTextW(hWnd, IDC_VAULT_PWD,  g_szVaultPwd,  127);
 
+            /* v4.2 (P0): 设置保存时也校验路径，不合法则不保存并提示 */
+            WCHAR pathErr[256] = {0};
+            if (g_szVaultPath[0] && !IsValidVaultPath(g_szVaultPath, pathErr, 256)) {
+                WCHAR msg[512];
+                _snwprintf(msg, 511,
+                    L"保险箱路径不合法，未保存。\r\n\r\n"
+                    L"原因：%ls\r\n\r\n"
+                    L"要求：\r\n"
+                    L"1. 不含 ' \" ` ; | & $ ( ) { } < >  等字符\r\n"
+                    L"2. 位于 C:\\Users\\  下\r\n"
+                    L"3. 后缀为 .vhdx", pathErr);
+                msg[511] = 0;
+                MessageBoxW(hWnd, msg, L"路径不合法", MB_OK | MB_ICONERROR);
+                g_szVaultPath[0] = 0;
+                SetDlgItemTextW(hWnd, IDC_VAULT_PATH, L"");
+                /* 不中断流程，密码等其他设置仍可保存 */
+            }
+
             SaveConfig();
             SetAutoRun(g_bAutoRun);
             UnregisterHotKey(g_hWndMain,HOTKEY_BOSS);
@@ -3295,6 +3431,23 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
             L"旧密码已被丢弃，请到【系统设置】中重新设置登录密码、锁屏密码和 BitLocker 密码。",
             L"BossTool 安全升级",
             MB_OK | MB_ICONWARNING);
+    }
+
+    /* v4.2 (P0): 路径不合法 - 通知用户，需重设保险箱路径 */
+    if (g_bVaultPathInvalid) {
+        WCHAR msg[768];
+        _snwprintf(msg, 767,
+            L"保险箱路径安全检查未通过，该路径已被清空。\r\n\r\n"
+            L"原因：%ls\r\n\r\n"
+            L"安全要求：\r\n"
+            L"1. 路径不得含 shell 元字符（' \" ` ; | & $ ( ) { } < > 等）\r\n"
+            L"2. 路径必须位于 C:\\Users\\  下\r\n"
+            L"3. 文件后缀必须为 .vhdx\r\n\r\n"
+            L"请到【系统设置】中重新选择 .vhdx 文件。",
+            g_szVaultPathError);
+        msg[767] = 0;
+        MessageBoxW(NULL, msg, L"保险箱路径不安全",
+                    MB_OK | MB_ICONERROR);
     }
 
     /* 安装键盘钩子 */
