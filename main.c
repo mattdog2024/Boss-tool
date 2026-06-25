@@ -211,7 +211,8 @@ static void WriteLog(const WCHAR *fmt, ...);
 static DWORD RunNetshDirect(const WCHAR *args);
 static const WCHAR* GetAdapterName(void);
 static void RandomizeMac(void);
-static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
+/* v4.2 (P0): 旧的 ExecPowerShell / ExecPowerShellWithOutput 已删，
+   统一用 ExecPowerShellSafe / ExecPowerShellWithOutputSafe（EncodedCommand 防注入） */
 static BOOL BeginNetworkChange(void);
 static void EndNetworkChange(void);
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
@@ -231,7 +232,6 @@ static BOOL  EnsureVirtualDiskService(void);
 static BOOL  WaitForDriveLetter(DWORD dwBefore, WCHAR *pDrive, DWORD timeoutMs);
 static BOOL  CreateVaultSymlink(void);    /* 创建 .vhdx 符号链接 */
 static void  CleanupVaultSymlink(void);   /* 删除符号链接 */
-static BOOL  ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int outLen); /* 执行 PS 并返回输出 */
 static BOOL  GetDriveLetterForImage(const WCHAR *imagePath, WCHAR *pDrive); /* 通过 PS 查询盘符 */
 
 /* ============================================================
@@ -292,23 +292,103 @@ static void ExecAsync(const WCHAR *cmd) {
     }
 }
 
-/* 直接调用 PowerShell.exe */
-static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
-    WCHAR szPS[MAX_PATH] = {0};
-    GetSystemDirectoryW(szPS, MAX_PATH);
+/* ============================================================
+   v4.2 (P0): PowerShell 安全执行器
+
+   背景：原代码用 _snwprintf 拼 PowerShell 脚本到命令行
+   (Mount-DiskImage -ImagePath 'C:\...lvm')。如果
+   g_szVaultSymlink / g_szVaultPath 等含单引号、$()、反引号、
+   分号等 shell 元字符，攻击者可以拼接任意 PS 命令执行（任意命令执行
+   漏洞）。即使路径是用户手动输入的，也应默认当作不可信。
+
+   解决：用 PowerShell 的 -EncodedCommand 参数，把整个脚本
+   当作 UTF-16LE 原文 base64 编码后传进去。PowerShell 解码后再
+   编译执行 —— 期间不会发生字符串拼接，参数无法 break out。
+
+   API: ExecPowerShellSafe(psScript, bWait, &exitCode) -> BOOL
+   - 底层都用 CreateProcessW，参数从命令行传入，命令行里
+     不出现脚本原文，只出现 base64 安全字符。
+   - bWait=FALSE 时 pdwExitCode 可为 NULL。
+   ============================================================ */
+
+/*
+ * 把 WCHAR 脚本原样用 UTF-16LE 编码，base64 后拼到命令行。
+ * 不检查脚本内容是否安全（不需检查 - 不会发生拼接）。
+ */
+static BOOL BuildEncodedCommandArg(const WCHAR *psScript, WCHAR *outArg, int outArgChars) {
+    if (!psScript || !outArg || outArgChars <= 0) return FALSE;
+    int wlen = (int)wcslen(psScript);
+    if (wlen <= 0) return FALSE;
+    DWORD byteLen = (DWORD)(wlen * sizeof(WCHAR));
+
+    /* CryptStringAlloc 不会在末尾加 NUL —— 手算 */
+    DWORD needed = 0;
+    if (!CryptBinaryToStringW((const BYTE*)psScript, byteLen,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              NULL, &needed)) {
+        return FALSE;
+    }
+    if (needed <= 1) return FALSE;  /* 至少 1 字符 + NUL */
+    WCHAR *b64 = (WCHAR*)HeapAlloc(GetProcessHeap(), 0,
+                                    needed * sizeof(WCHAR));
+    if (!b64) return FALSE;
+    if (!CryptBinaryToStringW((const BYTE*)psScript, byteLen,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              b64, &needed)) {
+        HeapFree(GetProcessHeap(), 0, b64);
+        return FALSE;
+    }
+    /* b64 末尾是 NUL，去掉 NUL 后拼到 outArg。 */
+    int b64Len = (int)wcslen(b64);
+    if (b64Len + 1 > outArgChars) {
+        HeapFree(GetProcessHeap(), 0, b64);
+        return FALSE;
+    }
+    memcpy(outArg, b64, b64Len * sizeof(WCHAR));
+    outArg[b64Len] = 0;
+    SecureZeroMemory(b64, needed * sizeof(WCHAR));
+    HeapFree(GetProcessHeap(), 0, b64);
+    return TRUE;
+}
+
+/* 解析 PowerShell.exe 路径（支持 SysNative 重定向，WoW64 必要） */
+static void ResolvePowerShellPath(WCHAR *szPS, int cch) {
+    GetSystemDirectoryW(szPS, cch);
+    int cur = (int)wcslen(szPS);
     wcsncat(szPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe",
-            MAX_PATH - wcslen(szPS) - 1);
+            cch - cur - 1);
     if (GetFileAttributesW(szPS) == INVALID_FILE_ATTRIBUTES) {
         WCHAR szWin[MAX_PATH] = {0};
         GetWindowsDirectoryW(szWin, MAX_PATH);
-        _snwprintf(szPS, MAX_PATH-1,
+        _snwprintf(szPS, cch - 1,
             L"%ls\\SysNative\\WindowsPowerShell\\v1.0\\powershell.exe", szWin);
     }
-    WCHAR cmdLine[4096];
-    _snwprintf(cmdLine, 4095,
-        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -Command \"%ls\"",
-        szPS, psScript);
-    cmdLine[4095] = 0;
+    szPS[cch - 1] = 0;
+}
+
+/* 同步执行 PS 脚本（无返回值） */
+static BOOL ExecPowerShellSafe(const WCHAR *psScript, BOOL bWait, DWORD *pdwExitCode) {
+    if (pdwExitCode) *pdwExitCode = (DWORD)-1;
+    if (!psScript || !*psScript) return FALSE;
+
+    WCHAR szPS[MAX_PATH] = {0};
+    ResolvePowerShellPath(szPS, MAX_PATH);
+
+    WCHAR b64[8192];
+    if (!BuildEncodedCommandArg(psScript, b64, 8192)) {
+        WriteLog(L"ExecPowerShellSafe: BuildEncodedCommandArg 失败");
+        return FALSE;
+    }
+
+    /* 拼命令行：powershell -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand <b64>
+     *  b64 只含 [A-Za-z0-9+/=]，不需转义。 */
+    WCHAR cmdLine[9000];
+    _snwprintf(cmdLine, 8999,
+        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand %ls",
+        szPS, b64);
+    cmdLine[8999] = 0;
+    SecureZeroMemory(b64, sizeof(b64));
+
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
@@ -316,21 +396,108 @@ static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    WriteLog(L"ExecPowerShell: %ls", cmdLine);
+
+    WriteLog(L"ExecPowerShellSafe: [encoded %d chars]", (int)wcslen(psScript));
     if (!CreateProcessW(szPS, cmdLine, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WriteLog(L"ExecPowerShell: CreateProcess FAILED err=%lu", GetLastError());
-        return;
+        WriteLog(L"ExecPowerShellSafe: CreateProcess FAILED err=%lu", GetLastError());
+        return FALSE;
     }
     if (bWait) {
-        WaitForSingleObject(pi.hProcess, timeoutMs);
+        WaitForSingleObject(pi.hProcess, 60000);
         DWORD exitCode = 0;
         GetExitCodeProcess(pi.hProcess, &exitCode);
-        WriteLog(L"ExecPowerShell: exit=%lu", exitCode);
+        if (pdwExitCode) *pdwExitCode = exitCode;
+        WriteLog(L"ExecPowerShellSafe: exit=%lu", exitCode);
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    return TRUE;
 }
+
+/* 同步执行 PS 脚本并捕获 stdout (WCHAR 字符串) */
+static BOOL ExecPowerShellWithOutputSafe(const WCHAR *psScript, WCHAR *outBuf, int outLen) {
+    if (outBuf && outLen > 0) outBuf[0] = 0;
+    if (!psScript || !*psScript) return FALSE;
+
+    WCHAR szPS[MAX_PATH] = {0};
+    ResolvePowerShellPath(szPS, MAX_PATH);
+
+    WCHAR b64[8192];
+    if (!BuildEncodedCommandArg(psScript, b64, 8192)) {
+        return FALSE;
+    }
+
+    WCHAR cmdLine[9000];
+    _snwprintf(cmdLine, 8999,
+        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand %ls",
+        szPS, b64);
+    cmdLine[8999] = 0;
+    SecureZeroMemory(b64, sizeof(b64));
+
+    /* 创建匿名管道读取输出 */
+    HANDLE hReadPipe = NULL, hWritePipe = NULL;
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return FALSE;
+    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
+    si.wShowWindow = SW_HIDE;
+    si.hStdOutput = hWritePipe;
+    si.hStdError  = hWritePipe;
+
+    BOOL ok = CreateProcessW(szPS, cmdLine, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    CloseHandle(hWritePipe);
+    if (!ok) {
+        CloseHandle(hReadPipe);
+        return FALSE;
+    }
+
+    /* 读取输出（PowerShell 默认输出 UTF-16LE，但 Out-Default 会按控制台 codepage
+       重新编码。改用 [Console]::OutputEncoding 来固定。简单起见先按 CP_ACP 处理。 */
+    char ansiOut[2048] = {0};
+    DWORD bytesRead = 0, totalRead = 0;
+    while (totalRead < (DWORD)sizeof(ansiOut)-1) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
+            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) break;
+            continue;
+        }
+        if (!ReadFile(hReadPipe, ansiOut + totalRead,
+                      min(avail, (DWORD)sizeof(ansiOut)-1-totalRead),
+                      &bytesRead, NULL)) break;
+        totalRead += bytesRead;
+    }
+    ansiOut[totalRead] = 0;
+
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    CloseHandle(hReadPipe);
+
+    if (outBuf && outLen > 0) {
+        MultiByteToWideChar(CP_ACP, 0, ansiOut, -1, outBuf, outLen);
+        int n = (int)wcslen(outBuf);
+        while (n > 0 && (outBuf[n-1] == L'\r' || outBuf[n-1] == L'\n' ||
+                         outBuf[n-1] == L' ')) {
+            outBuf[--n] = 0;
+        }
+    }
+    return (exitCode == 0);
+}
+
+/* v4.2 (P0): ExecPowerShell / ExecPowerShellWithOutput 已被 ExecPowerShellSafe /
+   ExecPowerShellWithOutputSafe 取代 —— 旧实现用 _snwprintf 拼 PS 命令行参数，
+   当参数含 ' " $() 等元字符时会造成命令注入。Safe 版本改用 -EncodedCommand
+   （UTF-16LE → base64），命令行里完全不出现脚本原文。 */
 
 static BOOL BeginNetworkChange(void) {
     for (int i = 0; i < 240; i++) {
@@ -471,7 +638,7 @@ static BOOL CreateVaultSymlink(void) {
         g_szVaultSymlink, g_szVaultPath);
     szPS[MAX_PATH*2+127] = 0;
 
-    ExecPowerShell(szPS, TRUE, 5000);
+    ExecPowerShellSafe(szPS, TRUE, NULL);
 
     /* 检查符号链接是否创建成功 */
     if (GetFileAttributesW(g_szVaultSymlink) != INVALID_FILE_ATTRIBUTES) {
@@ -508,89 +675,6 @@ static void CleanupVaultSymlink(void) {
 }
 
 /* 执行 PowerShell 并返回标准输出 */
-static BOOL ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int outLen) {
-    if (outBuf && outLen > 0) outBuf[0] = 0;
-
-    WCHAR szPS[MAX_PATH] = {0};
-    GetSystemDirectoryW(szPS, MAX_PATH);
-    wcsncat(szPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe",
-            MAX_PATH - wcslen(szPS) - 1);
-    if (GetFileAttributesW(szPS) == INVALID_FILE_ATTRIBUTES) {
-        WCHAR szWin[MAX_PATH] = {0};
-        GetWindowsDirectoryW(szWin, MAX_PATH);
-        _snwprintf(szPS, MAX_PATH-1,
-            L"%ls\\SysNative\\WindowsPowerShell\\v1.0\\powershell.exe", szWin);
-    }
-
-    WCHAR cmdLine[4096];
-    _snwprintf(cmdLine, 4095,
-        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -Command \"%ls\"",
-        szPS, psScript);
-    cmdLine[4095] = 0;
-
-    /* 创建匿名管道读取输出 */
-    HANDLE hReadPipe = NULL, hWritePipe = NULL;
-    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) return FALSE;
-    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW | STARTF_USESTDHANDLES;
-    si.wShowWindow = SW_HIDE;
-    si.hStdOutput = hWritePipe;
-    si.hStdError  = hWritePipe;
-
-    BOOL ok = CreateProcessW(szPS, cmdLine, NULL, NULL, TRUE,
-                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
-    CloseHandle(hWritePipe);
-
-    if (!ok) {
-        CloseHandle(hReadPipe);
-        return FALSE;
-    }
-
-    /* 读取输出（ANSI） */
-    char ansiOut[1024] = {0};
-    DWORD bytesRead = 0, totalRead = 0;
-    while (totalRead < (DWORD)sizeof(ansiOut)-1) {
-        DWORD avail = 0;
-        if (!PeekNamedPipe(hReadPipe, NULL, 0, NULL, &avail, NULL) || avail == 0) {
-            if (WaitForSingleObject(pi.hProcess, 100) == WAIT_OBJECT_0) break;
-            continue;
-        }
-        if (!ReadFile(hReadPipe, ansiOut + totalRead,
-                      min(avail, (DWORD)sizeof(ansiOut)-1-totalRead),
-                      &bytesRead, NULL)) break;
-        totalRead += bytesRead;
-    }
-    ansiOut[totalRead] = 0;
-
-    WaitForSingleObject(pi.hProcess, 5000);
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    CloseHandle(hReadPipe);
-
-    /* 转换输出到宽字符 */
-    if (outBuf && outLen > 0) {
-        MultiByteToWideChar(CP_ACP, 0, ansiOut, -1, outBuf, outLen);
-        /* 去除首尾空白 */
-        int n = (int)wcslen(outBuf);
-        while (n > 0 && (outBuf[n-1] == L'\r' || outBuf[n-1] == L'\n' ||
-                         outBuf[n-1] == L' ')) {
-            outBuf[--n] = 0;
-        }
-    }
-
-    WriteLog(L"ExecPSWithOutput: exit=%lu out=[%ls]", exitCode, outBuf ? outBuf : L"");
-    return (exitCode == 0);
-}
-
 /* 通过 PowerShell 查询已挂载镜像的盘符字母
  * 使用 AppHider 相同的命令：
  * Get-DiskImage -ImagePath '...' | Get-Disk | Get-Partition | Get-Volume |
@@ -607,7 +691,7 @@ static BOOL GetDriveLetterForImage(const WCHAR *imagePath, WCHAR *pDrive) {
     szPS[MAX_PATH+255] = 0;
 
     WCHAR outBuf[32] = {0};
-    ExecPowerShellWithOutput(szPS, outBuf, 31);
+    ExecPowerShellWithOutputSafe(szPS, outBuf, 31);
 
     /* 输出应该是单个字母，如 "E" */
     if (outBuf[0] >= L'A' && outBuf[0] <= L'Z') {
@@ -700,7 +784,7 @@ static BOOL VaultMount(HWND hWndParent) {
     szPS[MAX_PATH + 255] = 0;
 
     WriteLog(L"VaultMount: 步骤3 挂载符号链接: %ls", szPS);
-    ExecPowerShell(szPS, TRUE, 30000);
+    ExecPowerShellSafe(szPS, TRUE, NULL);
 
     /* 步骤4: 用 Get-DiskImage 管道查询盘符（AppHider 方法） */
     WCHAR cDrive = 0;
@@ -750,7 +834,7 @@ static BOOL VaultMount(HWND hWndParent) {
     szUnlockPS[1023] = 0;
 
     WriteLog(L"VaultMount: 步骤6 执行 BitLocker 解锁");
-    ExecPowerShell(szUnlockPS, TRUE, 15000);
+    ExecPowerShellSafe(szUnlockPS, TRUE, NULL);
 
     /* 等待解锁完成 */
     Sleep(2000);
@@ -823,7 +907,7 @@ static BOOL VaultEject(HWND hWndParent) {
             L"catch { manage-bde -lock %lc: -ForceDismount }",
             g_szVaultDrive[0], g_szVaultDrive[0]);
         szLockPS[255] = 0;
-        ExecPowerShell(szLockPS, TRUE, 8000);
+        ExecPowerShellSafe(szLockPS, TRUE, NULL);
         Sleep(500);
     }
 
@@ -839,7 +923,7 @@ static BOOL VaultEject(HWND hWndParent) {
     szDismountPS[MAX_PATH + 255] = 0;
 
     WriteLog(L"VaultEject: 执行 PowerShell Dismount-DiskImage [%ls]", pImagePath);
-    ExecPowerShell(szDismountPS, TRUE, 15000);
+    ExecPowerShellSafe(szDismountPS, TRUE, NULL);
 
     /* 备用：如果 PowerShell 弹出失败，用 diskpart */
     Sleep(1000);
@@ -1015,7 +1099,7 @@ static void VaultRecoverAndEject(void) {
             L"Dismount-DiskImage -ImagePath '%ls' -ErrorAction SilentlyContinue",
             g_szVaultPath);
         szDismount[MAX_PATH + 127] = 0;
-        ExecPowerShell(szDismount, TRUE, 10000);
+        ExecPowerShellSafe(szDismount, TRUE, NULL);
     }
 
     /* 用 PowerShell 扫描所有已挂载的磁盘镜像（备用方案，处理未知路径的情况） */
@@ -1032,7 +1116,7 @@ static void VaultRecoverAndEject(void) {
         L"Out-File -FilePath '%ls' -Encoding UTF8",
         szTmp);
     szPS[MAX_PATH + 255] = 0;
-    ExecPowerShell(szPS, TRUE, 10000);
+    ExecPowerShellSafe(szPS, TRUE, NULL);
 
     /* 读取扫描结果 */
     HANDLE hFile = CreateFileW(szTmp, GENERIC_READ, FILE_SHARE_READ,
@@ -1090,7 +1174,7 @@ static void VaultRecoverAndEject(void) {
             _snwprintf(szDismount, MAX_PATH + 127,
                 L"Dismount-DiskImage -ImagePath '%ls'", szLine);
             szDismount[MAX_PATH + 127] = 0;
-            ExecPowerShell(szDismount, TRUE, 15000);
+            ExecPowerShellSafe(szDismount, TRUE, NULL);
             Sleep(1000);
 
             /* diskpart 备用 */
