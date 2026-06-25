@@ -45,6 +45,7 @@
 #include <commctrl.h>
 #include <winreg.h>
 #include <aclapi.h>
+#include <wincrypt.h>
 #include <wchar.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1124,10 +1125,207 @@ static void VaultRecoverAndEject(void) {
 }
 
 /* ============================================================
-   v3.3: 保险箱配置的保存/加载
-   密码用简单 XOR 混淆存入注册表（不是加密，只是防止明文直接可见）
+   v4.2 (P0): 保险箱配置的保存/加载
+   密码改用 DPAPI (CryptProtectData) 加密后存入注册表。
+   DPAPI 绑定到当前用户/计算机，其他用户/计算机无法解密。
+
+   旧格式（XOR 0x5A / REG_SZ 明文）迁移策略：
+     - 旧值保留在注册表里，名字不变（VK / LP / SP）
+     - 新值使用新名字（VKD / LPD / SPD），前缀 4 字节 magic "DPK1"
+     - 首次启动检测到旧值存在但新值不存在 → 删除旧值，置 migration flag
+     - migration flag = 1 时，启动后提示用户去设置里重设密码
    ============================================================ */
-#define VAULT_XOR_KEY 0x5A
+
+/* 迁移标志：1 = 检测到旧格式密码，已清除，请用户去设置里重设 */
+static BOOL g_bPasswordMigrationNeeded = FALSE;
+
+/* DPAPI blob 前缀 magic（4 字节 ASCII） */
+static const BYTE DPAPI_MAGIC[4] = { 'D', 'P', 'K', '1' };
+
+/*
+ * 用 DPAPI 加密一段内存，写入注册表 REG_BINARY。
+ * 数据格式：[4 字节 magic "DPK1"][DPAPI blob]
+ * 失败返回 FALSE。
+ */
+static BOOL SaveSecretToReg(HKEY hKey, LPCWSTR valueName,
+                            const BYTE* data, DWORD len) {
+    DATA_BLOB inBlob;
+    DATA_BLOB outBlob;
+    inBlob.pbData = (BYTE*)data;
+    inBlob.cbData = len;
+
+    /* dwFlags = 0：DPAPI 绑定到当前用户 + 当前计算机，其他用户 / 其他计算机无法解密 */
+    if (!CryptProtectData(&inBlob, L"BossToolSecret", NULL, NULL, NULL,
+                          0, &outBlob)) {
+        WriteLog(L"SaveSecretToReg: CryptProtectData FAILED err=%lu", GetLastError());
+        return FALSE;
+    }
+
+    /* 分配带 magic 的 buffer */
+    DWORD totalLen = sizeof(DPAPI_MAGIC) + outBlob.cbData;
+    BYTE* pBuf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, totalLen);
+    if (!pBuf) {
+        LocalFree(outBlob.pbData);
+        return FALSE;
+    }
+    memcpy(pBuf, DPAPI_MAGIC, sizeof(DPAPI_MAGIC));
+    memcpy(pBuf + sizeof(DPAPI_MAGIC), outBlob.pbData, outBlob.cbData);
+    LocalFree(outBlob.pbData);
+
+    LONG rc = RegSetValueExW(hKey, valueName, 0, REG_BINARY,
+                             pBuf, totalLen);
+    HeapFree(GetProcessHeap(), 0, pBuf);
+    return (rc == ERROR_SUCCESS);
+}
+
+/*
+ * 从注册表读取 DPAPI 加密的 blob 并解密。
+ * 校验 magic 前缀，失败（不存在 / magic 不对 / DPAPI 失败）一律返回 FALSE。
+ * 输出 buffer 由调用方提供，输出长度通过 outLen 返回（不含结尾 NUL）。
+ */
+static BOOL LoadSecretFromReg(HKEY hKey, LPCWSTR valueName,
+                              BYTE* outBuf, DWORD bufSize, DWORD* outLen) {
+    if (outLen) *outLen = 0;
+    DWORD dwType = 0, dwSize = 0;
+    LONG rc = RegQueryValueExW(hKey, valueName, NULL, &dwType, NULL, &dwSize);
+    if (rc != ERROR_SUCCESS || dwType != REG_BINARY || dwSize <= sizeof(DPAPI_MAGIC)) {
+        return FALSE;
+    }
+    if (dwSize > 8192) return FALSE;  /* 上限保护 */
+
+    BYTE* pBuf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, dwSize);
+    if (!pBuf) return FALSE;
+    rc = RegQueryValueExW(hKey, valueName, NULL, &dwType, pBuf, &dwSize);
+    if (rc != ERROR_SUCCESS) {
+        HeapFree(GetProcessHeap(), 0, pBuf);
+        return FALSE;
+    }
+
+    /* 校验 magic */
+    if (memcmp(pBuf, DPAPI_MAGIC, sizeof(DPAPI_MAGIC)) != 0) {
+        HeapFree(GetProcessHeap(), 0, pBuf);
+        return FALSE;
+    }
+
+    DATA_BLOB inBlob;
+    DATA_BLOB outBlob;
+    inBlob.pbData = pBuf + sizeof(DPAPI_MAGIC);
+    inBlob.cbData = dwSize - sizeof(DPAPI_MAGIC);
+
+    if (!CryptUnprotectData(&inBlob, NULL, NULL, NULL, NULL, 0, &outBlob)) {
+        WriteLog(L"LoadSecretFromReg: CryptUnprotectData FAILED err=%lu", GetLastError());
+        HeapFree(GetProcessHeap(), 0, pBuf);
+        return FALSE;
+    }
+    HeapFree(GetProcessHeap(), 0, pBuf);
+
+    if (outBlob.cbData > bufSize) {
+        LocalFree(outBlob.pbData);
+        return FALSE;
+    }
+    memcpy(outBuf, outBlob.pbData, outBlob.cbData);
+    if (outLen) *outLen = outBlob.cbData;
+    SecureZeroMemory(outBlob.pbData, outBlob.cbData);
+    LocalFree(outBlob.pbData);
+    return TRUE;
+}
+
+/* 清理内存中的密码 buffer（进程退出时调用） */
+static void WipeSecrets(void) {
+    SecureZeroMemory(g_szLoginPwd, sizeof(g_szLoginPwd));
+    SecureZeroMemory(g_szLockPwd,  sizeof(g_szLockPwd));
+    SecureZeroMemory(g_szVaultPwd, sizeof(g_szVaultPwd));
+}
+
+/* 把一段 WCHAR 字符串当作 UTF-16LE 原文写入 DPAPI blob 注册表 */
+static BOOL SaveWCharSecretToReg(HKEY hKey, LPCWSTR valueName, const WCHAR* str) {
+    DWORD len = (DWORD)((wcslen(str) + 1) * sizeof(WCHAR));
+    return SaveSecretToReg(hKey, valueName, (const BYTE*)str, len);
+}
+
+/* 从 DPAPI blob 读出 UTF-16LE 字符串到 WCHAR buffer（确保 NUL 结尾） */
+static BOOL LoadWCharSecretFromReg(HKEY hKey, LPCWSTR valueName,
+                                   WCHAR* outBuf, DWORD bufChars) {
+    DWORD outLen = 0;
+    SecureZeroMemory(outBuf, bufChars * sizeof(WCHAR));
+    if (!LoadSecretFromReg(hKey, valueName, (BYTE*)outBuf,
+                           bufChars * sizeof(WCHAR), &outLen)) {
+        return FALSE;
+    }
+    if (outLen < sizeof(WCHAR)) {
+        SecureZeroMemory(outBuf, bufChars * sizeof(WCHAR));
+        return FALSE;
+    }
+    /* 确保 NUL 结尾（DPAPI blob 里已有 NUL 结尾，但保险起见再写一次） */
+    outBuf[bufChars - 1] = 0;
+    return TRUE;
+}
+
+/*
+ * 检测旧格式密码（XOR-encoded VK / REG_SZ LP / REG_SZ SP）是否存在，
+ * 如果存在且对应的新 DPAPI 值不存在 → 视为需要迁移：
+ *   - 删除旧值（不尝试解密，XOR 不是真加密）
+ *   - 把 DEFAULT_* 当作当前值（保留功能），但要求用户重设
+ *   - 设置 g_bPasswordMigrationNeeded = TRUE
+ */
+static void DetectLegacyPasswordsAndMigrate(HKEY hKey) {
+    DWORD dwType = 0, dwSize = 0;
+    BOOL bMigrated = FALSE;
+
+    /* 1) 旧 vault password (VK, REG_BINARY XOR) */
+    dwSize = 0;
+    if (RegQueryValueExW(hKey, L"VK", NULL, &dwType, NULL, &dwSize) == ERROR_SUCCESS) {
+        /* 新值 VKD 不存在？才需要迁移 */
+        DWORD newType = 0, newSize = 0;
+        if (RegQueryValueExW(hKey, L"VKD", NULL, &newType, NULL, &newSize) != ERROR_SUCCESS) {
+            WriteLog(L"Migration: 删除旧 XOR 编码的 VK");
+            RegDeleteValueW(hKey, L"VK");
+            SecureZeroMemory(g_szVaultPwd, sizeof(g_szVaultPwd));
+            bMigrated = TRUE;
+        }
+    }
+
+    /* 2) 旧 login password (LP, REG_SZ 明文) */
+    dwSize = 0;
+    if (RegQueryValueExW(hKey, L"LP", NULL, &dwType, NULL, &dwSize) == ERROR_SUCCESS
+        && dwType == REG_SZ) {
+        DWORD newType = 0, newSize = 0;
+        if (RegQueryValueExW(hKey, L"LPD", NULL, &newType, NULL, &newSize) != ERROR_SUCCESS) {
+            WriteLog(L"Migration: 删除旧明文 LP");
+            RegDeleteValueW(hKey, L"LP");
+            SecureZeroMemory(g_szLoginPwd, sizeof(g_szLoginPwd));
+            bMigrated = TRUE;
+        }
+    }
+
+    /* 3) 旧 lock password (SP, REG_SZ 明文) */
+    dwSize = 0;
+    if (RegQueryValueExW(hKey, L"SP", NULL, &dwType, NULL, &dwSize) == ERROR_SUCCESS
+        && dwType == REG_SZ) {
+        DWORD newType = 0, newSize = 0;
+        if (RegQueryValueExW(hKey, L"SPD", NULL, &newType, NULL, &newSize) != ERROR_SUCCESS) {
+            WriteLog(L"Migration: 删除旧明文 SP");
+            RegDeleteValueW(hKey, L"SP");
+            SecureZeroMemory(g_szLockPwd, sizeof(g_szLockPwd));
+            bMigrated = TRUE;
+        }
+    }
+
+    if (bMigrated) {
+        g_bPasswordMigrationNeeded = TRUE;
+        /* 标记位写盘，下次启动不再提示 */
+        DWORD one = 1;
+        RegSetValueExW(hKey, L"PWMIG", 0, REG_DWORD, (LPBYTE)&one, sizeof(one));
+    } else {
+        /* 之前已经迁移过的话（标记位 PWMIG 存在），不重复提示 */
+        DWORD migFlag = 0, sz = sizeof(migFlag);
+        if (RegQueryValueExW(hKey, L"PWMIG", NULL, &dwType,
+                             (LPBYTE)&migFlag, &sz) == ERROR_SUCCESS
+            && migFlag == 1) {
+            g_bPasswordMigrationNeeded = TRUE;
+        }
+    }
+}
 
 static void SaveVaultConfig(void) {
     HKEY hKey;
@@ -1137,21 +1335,17 @@ static void SaveVaultConfig(void) {
         if (RegCreateKeyExW(roots[r], CONFIG_REG_KEY,
                             0, NULL, REG_OPTION_NON_VOLATILE,
                             KEY_WRITE, NULL, &hKey, &dwDisp) == ERROR_SUCCESS) {
-            /* 保存路径（明文） */
+            /* 保存路径（明文 - 路径不视为敏感信息） */
             RegSetValueExW(hKey, L"VP", 0, REG_SZ,
                 (LPBYTE)g_szVaultPath,
                 (DWORD)((wcslen(g_szVaultPath)+1)*sizeof(WCHAR)));
 
-            /* 保存密码（XOR 混淆） */
-            int pwdLen = (int)wcslen(g_szVaultPwd);
-            BYTE pwdBuf[256];
-            for (int i = 0; i <= pwdLen; i++) {
-                WCHAR c = g_szVaultPwd[i];
-                pwdBuf[i*2]   = (BYTE)(c & 0xFF) ^ VAULT_XOR_KEY;
-                pwdBuf[i*2+1] = (BYTE)((c >> 8) & 0xFF) ^ VAULT_XOR_KEY;
+            /* 保存密码（DPAPI 加密） */
+            if (g_szVaultPwd[0]) {
+                if (!SaveWCharSecretToReg(hKey, L"VKD", g_szVaultPwd)) {
+                    WriteLog(L"SaveVaultConfig: 保存 VKD 失败");
+                }
             }
-            RegSetValueExW(hKey, L"VK", 0, REG_BINARY,
-                pwdBuf, (DWORD)((pwdLen+1)*2));
 
             RegCloseKey(hKey);
             break;
@@ -1166,25 +1360,23 @@ static void LoadVaultConfig(void) {
     for (int r = 0; r < 2; r++) {
         if (RegOpenKeyExW(roots[r], CONFIG_REG_KEY,
                           0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+            /* 检测旧格式密码并清理 */
+            DetectLegacyPasswordsAndMigrate(hKey);
+
             /* 加载路径 */
             dwSize = sizeof(g_szVaultPath);
             RegQueryValueExW(hKey, L"VP", NULL, &dwType,
                              (LPBYTE)g_szVaultPath, &dwSize);
 
-            /* 加载密码（XOR 解混淆） */
-            BYTE pwdBuf[256] = {0};
-            dwSize = sizeof(pwdBuf);
-            if (RegQueryValueExW(hKey, L"VK", NULL, &dwType,
-                                 pwdBuf, &dwSize) == ERROR_SUCCESS) {
-                int chars = (int)(dwSize / 2);
-                if (chars > 127) chars = 127;
-                for (int i = 0; i < chars; i++) {
-                    WCHAR c = (WCHAR)((pwdBuf[i*2] ^ VAULT_XOR_KEY) |
-                              ((pwdBuf[i*2+1] ^ VAULT_XOR_KEY) << 8));
-                    g_szVaultPwd[i] = c;
-                }
-                g_szVaultPwd[chars] = 0;
+            /* 加载密码（DPAPI 解密） */
+            WCHAR tmpPwd[128] = {0};
+            if (LoadWCharSecretFromReg(hKey, L"VKD", tmpPwd, 128)) {
+                wcsncpy(g_szVaultPwd, tmpPwd, 127);
+                g_szVaultPwd[127] = 0;
+            } else {
+                SecureZeroMemory(g_szVaultPwd, sizeof(g_szVaultPwd));
             }
+            SecureZeroMemory(tmpPwd, sizeof(tmpPwd));
 
             RegCloseKey(hKey);
             break;
@@ -1353,12 +1545,19 @@ static void LoadConfig(void) {
     for (int r = 0; r < 2; r++) {
         if (RegOpenKeyExW(roots[r], CONFIG_REG_KEY,
                           0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            dwSize = sizeof(g_szLoginPwd);
-            RegQueryValueExW(hKey, L"LP", NULL, &dwType,
-                             (LPBYTE)g_szLoginPwd, &dwSize);
-            dwSize = sizeof(g_szLockPwd);
-            RegQueryValueExW(hKey, L"SP", NULL, &dwType,
-                             (LPBYTE)g_szLockPwd, &dwSize);
+            /* 旧格式检测（这里只做清理，不读旧密码） */
+            DetectLegacyPasswordsAndMigrate(hKey);
+
+            /* v4.2 (P0): 登录/锁屏密码改用 DPAPI 加密存储 */
+            if (!LoadWCharSecretFromReg(hKey, L"LPD",
+                                        g_szLoginPwd, 64)) {
+                SecureZeroMemory(g_szLoginPwd, sizeof(g_szLoginPwd));
+            }
+            if (!LoadWCharSecretFromReg(hKey, L"SPD",
+                                        g_szLockPwd, 64)) {
+                SecureZeroMemory(g_szLockPwd, sizeof(g_szLockPwd));
+            }
+
             dwSize = sizeof(g_BossMod);
             RegQueryValueExW(hKey, L"BM", NULL, &dwType,
                              (LPBYTE)&g_BossMod, &dwSize);
@@ -1387,12 +1586,10 @@ static void SaveConfig(void) {
         if (RegCreateKeyExW(roots[r], CONFIG_REG_KEY,
                             0, NULL, REG_OPTION_NON_VOLATILE,
                             KEY_WRITE, NULL, &hKey, &dwDisp) == ERROR_SUCCESS) {
-            RegSetValueExW(hKey, L"LP", 0, REG_SZ,
-                (LPBYTE)g_szLoginPwd,
-                (DWORD)((wcslen(g_szLoginPwd)+1)*sizeof(WCHAR)));
-            RegSetValueExW(hKey, L"SP", 0, REG_SZ,
-                (LPBYTE)g_szLockPwd,
-                (DWORD)((wcslen(g_szLockPwd)+1)*sizeof(WCHAR)));
+            /* v4.2 (P0): 登录/锁屏密码改用 DPAPI 加密存储 */
+            SaveWCharSecretToReg(hKey, L"LPD", g_szLoginPwd);
+            SaveWCharSecretToReg(hKey, L"SPD", g_szLockPwd);
+
             RegSetValueExW(hKey, L"BM", 0, REG_DWORD,
                 (LPBYTE)&g_BossMod, sizeof(DWORD));
             RegSetValueExW(hKey, L"BK", 0, REG_DWORD,
@@ -3006,6 +3203,16 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
         0,0,0,0,NULL,NULL,hInstance,NULL);
     ShowWindow(g_hWndMain,SW_HIDE);
 
+    /* v4.2 (P0): 检测到旧格式密码已清除，提示用户去设置里重设 */
+    if (g_bPasswordMigrationNeeded) {
+        MessageBoxW(NULL,
+            L"检测到使用 v4.1 及更早版本的密码存储格式。\r\n"
+            L"出于安全考虑（XOR 混淆 / 明文存储 已被移除），\r\n"
+            L"旧密码已被丢弃，请到【系统设置】中重新设置登录密码、锁屏密码和 BitLocker 密码。",
+            L"BossTool 安全升级",
+            MB_OK | MB_ICONWARNING);
+    }
+
     /* 安装键盘钩子 */
     g_hKeyHook=SetWindowsHookExW(WH_KEYBOARD_LL,
                                   KeyboardHookProc,
@@ -3040,5 +3247,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX_ALT);
     UnlockIPReg();
     if(g_hMutex) CloseHandle(g_hMutex);
+
+    /* v4.2 (P0): 进程退出前清零内存中的敏感密码 */
+    WipeSecrets();
+
     return (int)msg.wParam;
 }
