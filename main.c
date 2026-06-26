@@ -117,6 +117,7 @@
 #define IDC_SET_APPLYIP  3011
 #define IDC_SET_ALLOWIP  3012
 #define IDC_SET_NETFIX   3013   /* v4.2.1: 紧急恢复网络按钮 */
+#define IDC_SET_RANDMAC  3014   /* v4.2.1: 手动 MAC 随机化（危险，不推荐频繁用） */
 
 /* v3.3: 隐私保险箱控件ID */
 #define IDC_VAULT_PATH      4001   /* .lvm 文件路径编辑框 */
@@ -142,7 +143,8 @@ static volatile BOOL g_bBossMode = FALSE;
 static volatile BOOL g_bLocked   = FALSE;
 static volatile LONG g_lNetworkChangeBusy = 0;
 static volatile LONG g_lEmergencyFixBusy  = 0;
-static volatile BOOL g_bEnableMacRandomization = TRUE;  /* 每次切换IP时自动随机更换MAC地址 */
+/* v4.2.1: 删除 g_bEnableMacRandomization。MAC 随机化已不再是自动行为，
+   改由用户在设置中手动触发（IDC_SET_RANDMAC），旧变量无任何引用。 */
 
 /* 配置 */
 static WCHAR g_szLoginPwd[64]   = DEFAULT_LOGIN_PWD;
@@ -200,6 +202,7 @@ DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
 DWORD WINAPI     EmergencyFixFromButtonThread(LPVOID);  /* v4.2.1: 手动按钮触发，完成后弹提示框 */
+DWORD WINAPI     RandomizeMacThread(LPVOID);  /* v4.2.1: 手动 MAC 随机化 */
 
 static void DoLockScreen(void);
 static void DoUnlockScreen(void);
@@ -1425,6 +1428,15 @@ static DWORD WINAPI EmergencyFixFromButtonThread(LPVOID p) {
     } else {
         MessageBoxW(NULL, msg, L"紧急恢复完成", MB_OK | MB_ICONINFORMATION);
     }
+    return 0;
+}
+
+/* v4.2.1: 手动 MAC 随机化线程。
+   SetIPBoss/SetIPWork 不再调用这个。只剩下用户从菜单主动触发。 */
+static DWORD WINAPI RandomizeMacThread(LPVOID p) {
+    (void)p;
+    WriteLog(L"RandomizeMacThread: 手动触发");
+    RandomizeMac();
     return 0;
 }
 
@@ -2915,6 +2927,20 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
         y+=40;
 
+        /* v4.2.1: 手动 MAC 随机化按钮（默认不跑。
+           老板键不再自动随机化，避免反复 disable/enable 网卡 触发
+           ERR_NO_BUFFER_SPACE。用户要要取奇小心点这个。 */
+        h=CreateWindowW(L"BUTTON",
+            L"\x2620 手动随机化 MAC（谨慎）",
+            WS_CHILD|WS_VISIBLE,
+            8,y,250,26,hWnd,(HMENU)IDC_SET_RANDMAC,g_hInst,NULL);
+        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
+        h=CreateWindowW(L"STATIC",
+            L"仅在需要彻底隐藏网络指纹时才点。会短暂断网。",
+            WS_CHILD|WS_VISIBLE,262,y+4,128,20,hWnd,NULL,g_hInst,NULL);
+        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
+        y+=30;
+
         /* 底部按钮行 */
         h=CreateWindowW(L"BUTTON",L"立即应用工作IP",
             WS_CHILD|WS_VISIBLE,
@@ -2983,6 +3009,19 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 L"完成后会弹一个提示框。",
                 L"紧急恢复网络", MB_OK | MB_ICONINFORMATION);
             StartDetachedThread(EmergencyFixFromButtonThread, NULL);
+        } else if(id==IDC_SET_RANDMAC) {
+            /* v4.2.1: 手动触发 MAC 随机化。异步跑，避免 UI 冻结。 */
+            if (MessageBoxW(hWnd,
+                L"手动 MAC 随机化将：\r\n"
+                L"  1. 写注册表修改网卡物理地址\r\n"
+                L"  2. 禁用 + 启用网卡（会断网 3–5 秒）\r\n\r\n"
+                L"频繁使用会累积网络栈问题（ERR_NO_BUFFER_SPACE 的根源之一）。\r\n"
+                L"除非你明确知道为什么要点这个，否则请不要频繁使用。\r\n\r\n"
+                L"确定要继续吗？",
+                L"确认随机化 MAC", MB_YESNO | MB_ICONWARNING) != IDYES) {
+                break;
+            }
+            StartDetachedThread(RandomizeMacThread, NULL);
         } else if(id==IDC_SET_SAVE) {
             /* 读取所有设置 */
             GetDlgItemTextW(hWnd,IDC_SET_LPWD,g_szLoginPwd,63);
