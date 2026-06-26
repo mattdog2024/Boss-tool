@@ -1195,19 +1195,98 @@ static void LoadVaultConfig(void) {
 /* ============================================================
    v3.2: 一键修复网络栈
    ============================================================ */
+/* v4.2.1: 本地化 EncodedCommand 风格的 PowerShell 安全执行器。
+   为什么不在这里用 v4.2 P0 的 ExecPowerShellSafe：
+   那个修复在独立分支上，本 commit 要能独立从 main 合入。
+   代码复制一份是为了避免跨分支依赖。逻辑同 v4.2 (P0)。
+   返回：脚本是否以 OK 退出。 */
+static BOOL RunPSScriptEncoded(const WCHAR *psScript, DWORD *pdwExitCode) {
+    if (pdwExitCode) *pdwExitCode = (DWORD)-1;
+    if (!psScript || !*psScript) return FALSE;
+
+    /* PowerShell.exe 路径 */
+    WCHAR szPS[MAX_PATH] = {0};
+    GetSystemDirectoryW(szPS, MAX_PATH);
+    int cur = (int)wcslen(szPS);
+    wcsncat(szPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe",
+            MAX_PATH - cur - 1);
+    if (GetFileAttributesW(szPS) == INVALID_FILE_ATTRIBUTES) {
+        WCHAR szWin[MAX_PATH] = {0};
+        GetWindowsDirectoryW(szWin, MAX_PATH);
+        _snwprintf(szPS, MAX_PATH - 1,
+            L"%ls\\SysNative\\WindowsPowerShell\\v1.0\\powershell.exe", szWin);
+    }
+
+    /* UTF-16LE → base64（用 CryptBinaryToStringW） */
+    DWORD byteLen = (DWORD)(wcslen(psScript) * sizeof(WCHAR));
+    DWORD needed = 0;
+    CryptBinaryToStringW((const BYTE*)psScript, byteLen,
+                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                          NULL, &needed);
+    if (needed <= 1) return FALSE;
+    WCHAR *b64 = (WCHAR*)HeapAlloc(GetProcessHeap(), 0,
+                                    needed * sizeof(WCHAR));
+    if (!b64) return FALSE;
+    if (!CryptBinaryToStringW((const BYTE*)psScript, byteLen,
+                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
+                              b64, &needed)) {
+        HeapFree(GetProcessHeap(), 0, b64);
+        return FALSE;
+    }
+    int b64Len = (int)wcslen(b64);
+
+    WCHAR cmdLine[9000];
+    _snwprintf(cmdLine, 8999,
+        L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand %ls",
+        szPS, b64);
+    cmdLine[8999] = 0;
+    SecureZeroMemory(b64, needed * sizeof(WCHAR));
+    HeapFree(GetProcessHeap(), 0, b64);
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    if (!CreateProcessW(szPS, cmdLine, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        WriteLog(L"RunPSScriptEncoded: CreateProcess FAILED err=%lu", GetLastError());
+        return FALSE;
+    }
+    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    if (pdwExitCode) *pdwExitCode = exitCode;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return TRUE;
+}
+
 static void EmergencyNetworkFix(void) {
     /* ============================================================
-       紧急网络修复 v4.0
+       紧急网络修复 v4.2.1
        核心原则：绝不执行需要重启才能生效的命令！
        禁止：ipv4 reset / winsock reset / route flush /
              delete arpcache / delete destinationcache / delete address
        这些命令在不重启的情况下会让网络栈进入不一致状态，
        反而加重 ERR_NO_BUFFER_SPACE。
 
+       v4.0 遗留问题：使用 netsh interface set interface ... admin=disabled
+       在 Windows 10 1903+ 上已被微软废弃。很多驱动（USB 网卡、Wi-Fi、
+       Hyper-V 虚拟网卡）会静默忽略这条命令，导致“紧急修复”实际上 noop。
+
+       v4.2.1 修复：改用 PowerShell 官方 cmdlet Disable-NetAdapter /
+       Enable-NetAdapter。微软官方推荐、对所有现代驱动都生效。
+
        正确策略（参考 AppHider EmergencyRestoreAsync）：
-       1. 禁用再启用网卡（硬重置，清空所有连接状态）
-       2. 重新设置IP（用 set 覆盖，不 delete）
-       3. 确保DNS服务运行
+       1. PowerShell 禁用再启用网卡（硬重置，清空所有连接状态）
+       2. 清空 DNS 客户端缓存、flush route 表
+       3. 重新设置IP（用 set 覆盖，不 delete）
+       4. 确保DNS服务运行
+       5. 记录结果，返出后调用方可提示用户
        ============================================================ */
 
     /* 步骤0: 强制锁定，不等待（紧急修复优先级最高） */
@@ -1215,27 +1294,47 @@ static void EmergencyNetworkFix(void) {
 
     const WCHAR *adpName = GetAdapterName();
     WCHAR args[1024];
+    WCHAR psScript[1024];
+    DWORD psExitCode = 0;
 
     /* ----------------------------------------------------------
-       步骤1: 禁用网卡（硬重置所有TCP/UDP连接和缓冲区）
-       这是解决 ERR_NO_BUFFER_SPACE 最有效的方法：
-       禁用网卡会让 Windows 立即释放该网卡上所有的
-       socket缓冲区、连接状态、非分页池内存。
+       步骤1: PowerShell 禁用网卡
+       使用 Get-NetAdapter 拿 ifIndex，Disable-NetAdapter -Confirm:$false
        ---------------------------------------------------------- */
+    _snwprintf(psScript, 1023,
+        L"$n = Get-NetAdapter -Name '%ls' -ErrorAction SilentlyContinue; "
+        L"if ($n) { "
+        L"  Disable-NetAdapter -Name '%ls' -Confirm:$false -ErrorAction SilentlyContinue; "
+        L"  Start-Sleep -Seconds 2; "
+        L"  Enable-NetAdapter -Name '%ls' -Confirm:$false -ErrorAction SilentlyContinue; "
+        L"  Start-Sleep -Seconds 3; "
+        L"  Write-Output 'OK' "
+        L"} else { "
+        L"  Write-Output 'NOTFOUND' "
+        L"}",
+        adpName, adpName, adpName);
+    psScript[1023] = 0;
+    RunPSScriptEncoded(psScript, &psExitCode);
+    WriteLog(L"EmergencyFix step1 (PS) exit=%lu", psExitCode);
+
+    /* 备用：netsh 路径（驱动名不能用 PowerShell 时降级） */
     _snwprintf(args, 1023,
         L"interface set interface name=\"%ls\" admin=disabled",
         adpName);
     RunNetshDirect(args);
     Sleep(2000);
-
-    /* ----------------------------------------------------------
-       步骤2: 启用网卡（网卡重新初始化，缓冲区全部清空）
-       ---------------------------------------------------------- */
     _snwprintf(args, 1023,
         L"interface set interface name=\"%ls\" admin=enabled",
         adpName);
     RunNetshDirect(args);
-    Sleep(3000);  /* 等待网卡完全就绪 */
+    Sleep(3000);
+
+    /* ----------------------------------------------------------
+       步骤2: 清理 DNS 客户端缓存和 route 表
+       （不需要重启，也不需要 winsock reset）
+       ---------------------------------------------------------- */
+    ExecHidden(L"ipconfig /flushdns");
+    ExecHidden(L"route /f");
 
     /* ----------------------------------------------------------
        步骤3: 确保 DNS Client 服务运行
@@ -1279,6 +1378,7 @@ static void EmergencyNetworkFix(void) {
 
     /* 步骤5: 恢复 IPGuard */
     InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 0);
+    WriteLog(L"EmergencyFix done");
 }
 
 DWORD WINAPI EmergencyFixThread(LPVOID p) {
