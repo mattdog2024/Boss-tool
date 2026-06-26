@@ -116,6 +116,7 @@
 #define IDC_SET_CLOSE    3010
 #define IDC_SET_APPLYIP  3011
 #define IDC_SET_ALLOWIP  3012
+#define IDC_SET_NETFIX   3013   /* v4.2.1: 紧急恢复网络按钮 */
 
 /* v3.3: 隐私保险箱控件ID */
 #define IDC_VAULT_PATH      4001   /* .lvm 文件路径编辑框 */
@@ -198,6 +199,7 @@ DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
+DWORD WINAPI     EmergencyFixFromButtonThread(LPVOID);  /* v4.2.1: 手动按钮触发，完成后弹提示框 */
 
 static void DoLockScreen(void);
 static void DoUnlockScreen(void);
@@ -232,6 +234,7 @@ static BOOL  CreateVaultSymlink(void);    /* 创建 .vhdx 符号链接 */
 static void  CleanupVaultSymlink(void);   /* 删除符号链接 */
 static BOOL  ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int outLen); /* 执行 PS 并返回输出 */
 static BOOL  GetDriveLetterForImage(const WCHAR *imagePath, WCHAR *pDrive); /* 通过 PS 查询盘符 */
+static BOOL  AdapterHasIP(const WCHAR *expectedIP);  /* v4.2.1: forward decl for EmergencyFixFromButtonThread */
 
 /* ============================================================
    工具：后台无窗口执行命令（带返回值）
@@ -1388,6 +1391,40 @@ DWORD WINAPI EmergencyFixThread(LPVOID p) {
     EmergencyNetworkFix();
     InterlockedExchange(&g_lEmergencyFixBusy, 0);
     MessageBeep(MB_OK);
+    return 0;
+}
+
+/* v4.2.1: 从设置窗口按钮触发的紧急恢复。
+   跟 EmergencyFixThread 的区别：完成后会弹一个明确的状态提示框。 */
+static DWORD WINAPI EmergencyFixFromButtonThread(LPVOID p) {
+    (void)p;
+    /* g_lEmergencyFixBusy 已被 button handler 设置为 1，直接跑 */
+    MessageBeep(MB_ICONEXCLAMATION);
+    EmergencyNetworkFix();
+    InterlockedExchange(&g_lEmergencyFixBusy, 0);
+    MessageBeep(MB_OK);
+    /* 检查当前 IP 是否已恢复 */
+    BOOL ipOK = FALSE;
+    if (g_szExpectedIP[0]) {
+        ipOK = AdapterHasIP(g_szExpectedIP);
+    }
+    WCHAR msg[512];
+    _snwprintf(msg, 511,
+        L"紧急恢复已完成。\r\n\r\n"
+        L"网卡：已禁用并启用（网络栈重置）\r\n"
+        L"DNS 缓存：已清空\r\n"
+        L"route 表：已清空\r\n"
+        L"IP 重设：%ls\r\n\r\n"
+        L"检测到期望 IP：%s\r\n\r\n"
+        L"现在请试用一下网络。如果还是不行，请重启电脑。",
+        g_bBossMode ? IP_BOSS : IP_WORK1,
+        ipOK ? L"是" : L"否 （可能需要几秒才能生效）");
+    msg[511] = 0;
+    if (g_hWndSettings && IsWindow(g_hWndSettings)) {
+        MessageBoxW(g_hWndSettings, msg, L"紧急恢复完成", MB_OK | MB_ICONINFORMATION);
+    } else {
+        MessageBoxW(NULL, msg, L"紧急恢复完成", MB_OK | MB_ICONINFORMATION);
+    }
     return 0;
 }
 
@@ -2865,6 +2902,19 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
         y+=38;
 
+        /* v4.2.1: 紧急恢复网络按钮 —— 明显的大红块，使用 BS_DEFPUSHBUTTON 获得粗框 */
+        h=CreateWindowW(L"BUTTON",
+            L"\x2620 紧急恢复网络 (Ctrl+Alt+F12)",
+            WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+            8,y,250,32,hWnd,(HMENU)IDC_SET_NETFIX,g_hInst,NULL);
+        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
+        /* 说明文字 */
+        h=CreateWindowW(L"STATIC",
+            L"重置网络栈 + 重设 IP，遇到 ERR_NO_BUFFER_SPACE / 不能上网点这个",
+            WS_CHILD|WS_VISIBLE,262,y+6,128,20,hWnd,NULL,g_hInst,NULL);
+        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
+        y+=40;
+
         /* 底部按钮行 */
         h=CreateWindowW(L"BUTTON",L"立即应用工作IP",
             WS_CHILD|WS_VISIBLE,
@@ -2915,6 +2965,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             VaultMount(hWnd);
         } else if(id==IDC_VAULT_EJECT) {
             VaultEject(hWnd);
+        } else if(id==IDC_SET_NETFIX) {
+            /* v4.2.1: 手动点 "紧急恢复网络" 按钮。
+               异步跑，跑完后弹成功提示框（区别于 IPGuard 静默调用）。 */
+            if (InterlockedCompareExchange(&g_lEmergencyFixBusy, 1, 0) != 0) {
+                MessageBoxW(hWnd,
+                    L"紧急恢复已在进行中，请等它完成（一般需 8–10 秒）。",
+                    L"请稍候", MB_OK | MB_ICONINFORMATION);
+                break;
+            }
+            MessageBoxW(hWnd,
+                L"开始重置网络栈。\r\n\r\n"
+                L"接下来 8–10 秒会出现：\r\n"
+                L"  1. 网卡被禁用/启用（会断网 1–2 秒）\r\n"
+                L"  2. 重新设置 IP、DNS\r\n"
+                L"  3. 刷 DNS 缓存、route 表\r\n\r\n"
+                L"完成后会弹一个提示框。",
+                L"紧急恢复网络", MB_OK | MB_ICONINFORMATION);
+            StartDetachedThread(EmergencyFixFromButtonThread, NULL);
         } else if(id==IDC_SET_SAVE) {
             /* 读取所有设置 */
             GetDlgItemTextW(hWnd,IDC_SET_LPWD,g_szLoginPwd,63);
