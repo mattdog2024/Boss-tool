@@ -1205,7 +1205,51 @@ static void LoadVaultConfig(void) {
    为什么不在这里用 v4.2 P0 的 ExecPowerShellSafe：
    那个修复在独立分支上，本 commit 要能独立从 main 合入。
    代码复制一份是为了避免跨分支依赖。逻辑同 v4.2 (P0)。
-   返回：脚本是否以 OK 退出。 */
+   返回：脚本是否以 OK 退出。
+
+   v4.2.1 hotfix: 用手写 base64 编码代替 CryptBinaryToStringW。
+   原因：mingw-w64 13+ 把 CryptBinaryToStringW 从 advapi32 拆到 crypt32，
+   CI 编译会报 undefined reference。纯 C 实现避免依赖该 API。 */
+
+/* 标准 base64 字符表 (RFC 4648) */
+static const char BASE64_CHARS[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/* 把二进制 buffer 编码为 base64 字符串（输出 WCHAR，PowerShell 接受宽字符）。
+   输出不含 CRLF，每 76 字符也不换行（CryptBinaryToStringW + NOCRLF 的行为）。
+   返回写入的 WCHAR 数量（不含结尾 NUL）。失败返回 -1。 */
+static int Base64EncodeW(const BYTE *data, DWORD dataLen, WCHAR *out, int outChars) {
+    /* 输出长度 = ceil(dataLen/3) * 4, 再加 1 个 NUL */
+    int needed = ((int)dataLen + 2) / 3 * 4 + 1;
+    if (outChars < needed) return -1;
+    int i = 0, j = 0;
+    while (i + 3 <= (int)dataLen) {
+        UINT v = ((UINT)data[i] << 16) | ((UINT)data[i+1] << 8) | data[i+2];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 18) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 12) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 6) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[v & 0x3F];
+        i += 3;
+    }
+    /* 尾巴：1 或 2 个剩余字节 */
+    int rem = (int)dataLen - i;
+    if (rem == 1) {
+        UINT v = (UINT)data[i] << 16;
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 18) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 12) & 0x3F];
+        out[j++] = L'=';
+        out[j++] = L'=';
+    } else if (rem == 2) {
+        UINT v = ((UINT)data[i] << 16) | ((UINT)data[i+1] << 8);
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 18) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 12) & 0x3F];
+        out[j++] = (WCHAR)BASE64_CHARS[(v >> 6) & 0x3F];
+        out[j++] = L'=';
+    }
+    out[j] = 0;
+    return j;
+}
+
 static BOOL RunPSScriptEncoded(const WCHAR *psScript, DWORD *pdwExitCode) {
     if (pdwExitCode) *pdwExitCode = (DWORD)-1;
     if (!psScript || !*psScript) return FALSE;
@@ -1223,30 +1267,24 @@ static BOOL RunPSScriptEncoded(const WCHAR *psScript, DWORD *pdwExitCode) {
             L"%ls\\SysNative\\WindowsPowerShell\\v1.0\\powershell.exe", szWin);
     }
 
-    /* UTF-16LE → base64（用 CryptBinaryToStringW） */
+    /* UTF-16LE → base64（手写实现，不需要 crypt32 库） */
     DWORD byteLen = (DWORD)(wcslen(psScript) * sizeof(WCHAR));
-    DWORD needed = 0;
-    CryptBinaryToStringW((const BYTE*)psScript, byteLen,
-                          CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                          NULL, &needed);
-    if (needed <= 1) return FALSE;
+    /* base64 输出长度 = ceil(byteLen/3) * 4 + 1 NUL */
+    int b64Chars = (int)((byteLen + 2) / 3) * 4 + 1;
     WCHAR *b64 = (WCHAR*)HeapAlloc(GetProcessHeap(), 0,
-                                    needed * sizeof(WCHAR));
+                                    b64Chars * sizeof(WCHAR));
     if (!b64) return FALSE;
-    if (!CryptBinaryToStringW((const BYTE*)psScript, byteLen,
-                              CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF,
-                              b64, &needed)) {
+    if (Base64EncodeW((const BYTE*)psScript, byteLen, b64, b64Chars) < 0) {
         HeapFree(GetProcessHeap(), 0, b64);
         return FALSE;
     }
-    int b64Len = (int)wcslen(b64);
 
     WCHAR cmdLine[9000];
     _snwprintf(cmdLine, 8999,
         L"\"%ls\" -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand %ls",
         szPS, b64);
     cmdLine[8999] = 0;
-    SecureZeroMemory(b64, needed * sizeof(WCHAR));
+    SecureZeroMemory(b64, b64Chars * sizeof(WCHAR));
     HeapFree(GetProcessHeap(), 0, b64);
 
     STARTUPINFOW si;
