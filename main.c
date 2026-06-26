@@ -201,8 +201,8 @@ DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
-DWORD WINAPI     EmergencyFixFromButtonThread(LPVOID);  /* v4.2.1: 手动按钮触发，完成后弹提示框 */
-DWORD WINAPI     RandomizeMacThread(LPVOID);  /* v4.2.1: 手动 MAC 随机化 */
+static DWORD WINAPI EmergencyFixFromButtonThread(LPVOID);  /* v4.2.1: 手动按钮触发，完成后弹提示框 */
+static DWORD WINAPI RandomizeMacThread(LPVOID);  /* v4.2.1: 手动 MAC 随机化 */
 
 static void DoLockScreen(void);
 static void DoUnlockScreen(void);
