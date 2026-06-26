@@ -44,7 +44,9 @@ jobs:
       - name: Build ${{ matrix.arch }} binaries
         shell: msys2 {0}
         run: |
-          gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
+          # v4.2.1: 加 -lcrypt32 - CryptBinaryToStringW 在新版 MinGW 被移到 crypt32.dll
+          # （旧版在 advapi32.dll，但 mingw-w64 13+ 拆开了）
+          gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lcrypt32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
           gcc -O2 -municode -mwindows -o "${{ matrix.acl_exe }}" fix_acl_ultimate.c -ladvapi32 -lshell32 -static
           gcc -O2 -municode -mwindows -o "${{ matrix.killer_exe }}" BossToolKiller.c -ladvapi32 -lshell32 -luser32 -static
 
