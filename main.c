@@ -1801,7 +1801,11 @@ static void CloseNotepad(void) {
 
 static void SetIPWork(void) {
     if (!BeginNetworkChange()) return;
-    if (g_bEnableMacRandomization) RandomizeMac();
+    /* v4.2.1: 不再自动 MAC 随机化。
+     * 原因：每次切 IP 都 disable/enable 网卡会反复重置网络栈，nonpaged pool
+     * 碎片化累积到一定阈值后，任何切 IP 操作都会引发 WSAENOBUFS (10055)。
+     * 反复按老板键 10+ 次看不出问题，但中间用一阵子网络后再切，就 100% 报错。
+     * MAC 随机化改为用户手动从菜单触发（仅在用户明确需要时执行）。 */
     wcsncpy(g_szExpectedIP, IP_WORK1, 63);
     ApplyIP(IP_WORK1, IP_WORK_MASK, IP_WORK_GW, IP_WORK_DNS, IP_WORK2, IP_WORK_MASK);
     LockIPReg();
@@ -1811,7 +1815,7 @@ static void SetIPWork(void) {
 
 static void SetIPBoss(void) {
     if (!BeginNetworkChange()) return;
-    if (g_bEnableMacRandomization) RandomizeMac();
+    /* v4.2.1: 同样去掉自动 MAC 随机化，见 SetIPWork 注释 */
     wcsncpy(g_szExpectedIP, IP_BOSS, 63);
     ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
     LockIPReg();
