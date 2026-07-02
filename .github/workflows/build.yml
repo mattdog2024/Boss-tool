@@ -3,51 +3,51 @@ name: Build BossTool
 on:
   push:
     branches: [ main, master ]
-  pull_request:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
     strategy:
+      fail-fast: false
       matrix:
-        arch: [x64, x86]
-    
+        include:
+          - arch: x64
+            msystem: UCRT64
+            packages: mingw-w64-ucrt-x86_64-gcc
+            boss_exe: BossTool.exe
+            acl_exe: FixACLUltimate.exe
+            killer_exe: BossToolKiller.exe
+          - arch: x86
+            msystem: MINGW32
+            packages: mingw-w64-i686-gcc
+            boss_exe: BossTool_x86.exe
+            acl_exe: FixACLUltimate_x86.exe
+            killer_exe: BossToolKiller_x86.exe
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Setup MSVC
-      uses: ilammy/msvc-dev-cmd@v2
-      with:
-        arch: ${{ matrix.arch }}
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: ${{ matrix.packages }}
 
-    - name: Build BossTool
-      shell: cmd
-      run: |
-        cl /nologo /W3 /O2 /Fe:BossTool.exe main.c user32.lib shell32.lib ole32.lib advapi32.lib iphlpapi.lib ws2_32.lib shlwapi.lib version.lib netapi32.lib
+      - name: Build ${{ matrix.arch }} binaries
+        shell: msys2 {0}
+        run: |
+          gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.acl_exe }}" fix_acl_ultimate.c -ladvapi32 -lshell32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.killer_exe }}" BossToolKiller.c -ladvapi32 -lshell32 -luser32 -static
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: BossTool-${{ matrix.arch }}
-        path: BossTool.exe
-
-  release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-    - name: Download x64 artifact
-      uses: actions/download-artifact@v4
-      with:
-        name: BossTool-x64
-        path: release
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: release/BossTool.exe
-        name: BossTool ${{ github.ref_name }}
-        generate_release_notes: true
+      - name: Upload ${{ matrix.arch }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BossTool-CI-${{ matrix.arch }}
+          path: |
+            ${{ matrix.boss_exe }}
+            ${{ matrix.acl_exe }}
+            ${{ matrix.killer_exe }}
