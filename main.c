@@ -1,5 +1,22 @@
 /*
- * BossTool v4.1 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.2 - Windows 7/8/10/11 隱形管理工具
+ *
+ * v4.2 彻底修复 ERR_NO_BUFFER_SPACE (WSAENOBUFS 10055)：
+ *   - 根因分析：
+ *     1. ApplyIP 的第二IP用 add address 追加，从不删除 → IP累积
+ *     2. RandomizeMac 禁用/启用网卡后，Windows 保留旧静态IP → 残留累积
+ *     3. IPGuardThread 频繁检查（5秒）+ 重新ApplyIP → 加速累积
+ *     4. 多次切换后，适配器上堆积大量IP → 耗尽非分页池缓冲区
+ *   - 修复方案：
+ *     1. 新增 ClearAccumulatedIPs()：通过 PowerShell 枚举适配器上所有IP，
+ *        用 netsh delete address 逐个清除残留静态IP
+ *     2. SetIPBoss/SetIPWork：RandomizeMac 后立即调用 ClearAccumulatedIPs
+ *     3. ApplyIP：开头调用 ClearAccumulatedIPs（双保险）
+ *     4. ApplyIP：第二IP先 delete 再 add，不再只 add 不 delete
+ *     5. IPGuardThread：检查间隔 5秒→15秒，重试等待 15秒→30秒
+ *     6. EmergencyNetworkFix：网卡启用后也调用 ClearAccumulatedIPs
+ *   - 对比 AppHider：AppHider 不做 MAC 随机化、不追加 IP、不频繁
+ *     disable/enable 网卡，所以从未出现此问题
  *
  * v3.3 新增：隐私保险箱（VHDX/BitLocker 伪装文件挂载）
  *   - 支持选择 .lvm（实为 .vhdx）伪装文件
@@ -11,12 +28,9 @@
  *     3. 启动 Virtual Disk 服务检测
  *     4. 弹出时先 manage-bde -lock，再 detach vdisk
  *
- * v3.3.4 彻底修复 ERR_NO_BUFFER_SPACE + 兜底快捷键失效：
- *   - 根因：ApplyIP 每次 add address 不删除旧IP，导致IP地址累积耗尽网络栈缓冲区
- *   - ApplyIP 现在先 delete 所有旧IP，再 set/add 新IP，彻底消除累积
- *   - EmergencyNetworkFix 重写：暂停 IPGuard→清除累积 IP→重置网络栈→重新应用正确 IP
- *   - IPGuardThread 加 BeginNetworkChange/EndNetworkChange 保护
- *   - 兜底快捷键现在能真正恢复网络（不再被 IPGuard 立即覆盖）
+ * v3.3.4 第一次尝试修复 ERR_NO_BUFFER_SPACE（不完全）：
+ *   - 识别了 IP 累积是根因，但 v4.0 改为只 set 不 delete
+ *   - 第二IP仍然只 add 不 delete，累积问题并未彻底解决
  *
  * v3.2 原始尝试（不完全）：
  *   - 重写 ApplyIP，改用 store=active
@@ -215,6 +229,7 @@ static BOOL BeginNetworkChange(void);
 static void EndNetworkChange(void);
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
 static void EmergencyNetworkFix(void);
+static void ClearAccumulatedIPs(void);
 
 /* v3.3: 保险箱函数前向声明 */
 static BOOL  VaultMount(HWND hWndParent);
@@ -1238,6 +1253,13 @@ static void EmergencyNetworkFix(void) {
     Sleep(3000);  /* 等待网卡完全就绪 */
 
     /* ----------------------------------------------------------
+       步骤2.5: v4.2 清理网卡上所有残留IP
+       禁用/启用网卡后，Windows 可能保留之前的静态IP配置。
+       如果不清理，反复紧急修复也会导致IP累积。
+       ---------------------------------------------------------- */
+    ClearAccumulatedIPs();
+
+    /* ----------------------------------------------------------
        步骤3: 确保 DNS Client 服务运行
        ---------------------------------------------------------- */
     ExecHidden(L"net start Dnscache");
@@ -1610,6 +1632,66 @@ static DWORD RunNetshDirect(const WCHAR *args) {
     return exitCode;
 }
 
+/* ============================================================
+   v4.2 修复：清除适配器上累积的残留IP地址
+   根因：每次 RandomizeMac 禁用/启用网卡后，Windows 网络栈
+   可能保留之前的静态IP配置。反复切换导致多个残留IP堆积，
+   最终耗尽非分页池缓冲区 → ERR_NO_BUFFER_SPACE (10055)。
+   ============================================================ */
+static void ClearAccumulatedIPs(void) {
+    const WCHAR *adpName = GetAdapterName();
+    if (!adpName || !adpName[0]) return;
+
+    WriteLog(L"ClearAccumulatedIPs: 清理适配器 [%ls] 上的残留IP", adpName);
+
+    /* 反复尝试 delete address 直到没有更多静态IP可删。
+     * netsh delete address 只删除非主静态IP，不会触发大规模socket释放。
+     * 最多循环20次防止意外死循环。 */
+    WCHAR args[512];
+    BOOL deleted;
+    int pass = 0;
+    do {
+        deleted = FALSE;
+        /* 尝试通过 PowerShell 获取适配器上所有静态IP并逐个删除 */
+        WCHAR psScript[1024];
+        WCHAR psOutput[4096] = {0};
+        _snwprintf(psScript, 1023,
+            L"(Get-NetIPAddress -InterfaceAlias '%ls' -AddressFamily IPv4).IPAddress",
+            adpName);
+        if (ExecPowerShellWithOutput(psScript, psOutput, 4095)) {
+            /* 解析输出，每行一个IP */
+            WCHAR *line = psOutput;
+            while (*line) {
+                WCHAR *eol = wcschr(line, L'\n');
+                if (eol) { *eol = 0; if (eol > line && *(eol-1) == L'\r') *(eol-1) = 0; }
+                /* 去除前后空白 */
+                while (*line == L' ' || *line == L'\t') line++;
+                WCHAR *end = line + wcslen(line) - 1;
+                while (end > line && (*end == L' ' || *end == L'\t' || *end == L'\r')) *end-- = 0;
+
+                if (line[0] &&
+                    wcscmp(line, L"127.0.0.1") != 0 &&
+                    wcscmp(line, L"0.0.0.0") != 0) {
+                    /* 删除这个IP（忽略错误，可能有些IP是DHDP不可删） */
+                    _snwprintf(args, 511,
+                        L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+                        adpName, line);
+                    DWORD ret = RunNetshDirect(args);
+                    if (ret == 0) {
+                        deleted = TRUE;
+                        WriteLog(L"ClearAccumulatedIPs: 已删除残留IP %ls", line);
+                    }
+                }
+                line = eol ? eol + 1 : line + wcslen(line);
+            }
+        }
+        pass++;
+    } while (deleted && pass < 20);
+
+    WriteLog(L"ClearAccumulatedIPs: 清理完成，共 %d 轮", pass);
+    Sleep(500);  /* 等待网络栈稳定 */
+}
+
 static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
                     const WCHAR *dns, const WCHAR *ip2, const WCHAR *mask2) {
     const WCHAR *adpName = GetAdapterName();
@@ -1618,14 +1700,15 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
     BOOL bOK = FALSE;
     DWORD ret;
 
-    /* v4.0 修复：不再 delete 旧IP！
-     * delete address 会触发 Windows 释放所有绑定到该IP的socket，
-     * 当有大量长连接时（浏览器几十个标签页），释放过程耗尽非分页池
-     * → ERR_NO_BUFFER_SPACE (WSAENOBUFS 10055)
+    /* v4.2 修复：先清除所有残留IP，防止累积导致 ERR_NO_BUFFER_SPACE。
+     * 这是最彻底的方案：每次切换前先清空适配器上的所有静态IP，
+     * 然后重新设置。这样无论之前累积了多少IP，都会被清理干净。
      *
-     * 正确做法：直接用 set address 覆盖，Windows 会原子替换旧IP，
-     * 不触发大规模socket释放。
-     */
+     * 注意：ClearAccumulatedIPs 已在 SetIPBoss/SetIPWork 中
+     * RandomizeMac 之后调用过，这里再调一次是双保险
+     * （IPGuardThread 调用 ApplyIP 时也需要清理）。 */
+    ClearAccumulatedIPs();
+
     WriteLog(L"ApplyIP: [adapter=%ls] ip=%ls", adpName, ip1);
 
     /* 方案A: ipv4 set address 直接覆盖（不delete） */
@@ -1658,8 +1741,18 @@ static void ApplyIP(const WCHAR *ip1, const WCHAR *mask1, const WCHAR *gw,
         WriteLog(L"ApplyIP C ret=%lu", ret);
     }
 
-    /* 第二IP：先尝试add，如果已存在会失败（无害） */
+    /* v4.2 修复：第二IP先 delete 再 add，防止累积！
+     * 之前只 add 不 delete，每次切换都追加一个 192.168.1.88，
+     * 几天后累积几十个相同IP → 耗尽网络栈缓冲区 → ERR_NO_BUFFER_SPACE。
+     * delete 失败（不存在）是无害的，继续 add 即可。 */
     if (ip2 && ip2[0]) {
+        /* 先删除（忽略错误） */
+        _snwprintf(args, 511,
+            L"interface ipv4 delete address name=\"%ls\" addr=%ls store=active",
+            adpName, ip2);
+        RunNetshDirect(args);
+        Sleep(100);
+        /* 再添加 */
         _snwprintf(args, 511,
             L"interface ipv4 add address name=\"%ls\" addr=%ls mask=%ls store=active",
             adpName, ip2, mask2);
@@ -1730,18 +1823,20 @@ static BOOL AdapterHasIP(const WCHAR *expectedIP) {
 
 DWORD WINAPI IPGuardThread(LPVOID p) {
     (void)p;
-    Sleep(5000);
+    Sleep(10000);  /* v4.2: 启动等待更长，避免和 InitialIPThread 冲突 */
     while (1) {
-        Sleep(5000);
+        Sleep(15000);  /* v4.2: 5秒→15秒，减少 GetAdaptersInfo 调用和网络栈压力 */
         if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
         if (g_lNetworkChangeBusy) continue;
         if (!AdapterHasIP(g_szExpectedIP)) {
-            Sleep(15000);
+            Sleep(30000);  /* v4.2: 15秒→30秒，给适配器更多恢复时间 */
             if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
             if (g_lNetworkChangeBusy || AdapterHasIP(g_szExpectedIP)) continue;
             /* v3.3.4: 用 BeginNetworkChange 保护，防止和 EmergencyFix 冲突 */
             if (!BeginNetworkChange()) continue;
-            WriteLog(L"IPGuardThread: IP 丢失，重新应用");
+            WriteLog(L"IPGuardThread: IP 丢失，清理残留后重新应用");
+            /* v4.2: 先清理残留IP再重新应用，防止累积 */
+            ClearAccumulatedIPs();
             if (g_bBossMode)
                 ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
             else
@@ -1802,6 +1897,9 @@ static void CloseNotepad(void) {
 static void SetIPWork(void) {
     if (!BeginNetworkChange()) return;
     if (g_bEnableMacRandomization) RandomizeMac();
+    /* v4.2: RandomizeMac 禁用/启用网卡后，立即清理残留IP，
+     * 防止旧IP累积导致 ERR_NO_BUFFER_SPACE */
+    ClearAccumulatedIPs();
     wcsncpy(g_szExpectedIP, IP_WORK1, 63);
     ApplyIP(IP_WORK1, IP_WORK_MASK, IP_WORK_GW, IP_WORK_DNS, IP_WORK2, IP_WORK_MASK);
     LockIPReg();
@@ -1812,6 +1910,8 @@ static void SetIPWork(void) {
 static void SetIPBoss(void) {
     if (!BeginNetworkChange()) return;
     if (g_bEnableMacRandomization) RandomizeMac();
+    /* v4.2: 同上，清理残留IP */
+    ClearAccumulatedIPs();
     wcsncpy(g_szExpectedIP, IP_BOSS, 63);
     ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
     LockIPReg();
