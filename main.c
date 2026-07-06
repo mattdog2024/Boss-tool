@@ -1,22 +1,39 @@
 /*
- * BossTool v4.2 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.3 - Windows 7/8/10/11 隱形管理工具
  *
- * v4.2 彻底修复 ERR_NO_BUFFER_SPACE (WSAENOBUFS 10055)：
- *   - 根因分析：
- *     1. ApplyIP 的第二IP用 add address 追加，从不删除 → IP累积
- *     2. RandomizeMac 禁用/启用网卡后，Windows 保留旧静态IP → 残留累积
- *     3. IPGuardThread 频繁检查（5秒）+ 重新ApplyIP → 加速累积
- *     4. 多次切换后，适配器上堆积大量IP → 耗尽非分页池缓冲区
+ * v4.3 终极修复 ERR_NO_BUFFER_SPACE (WSAENOBUFS 10055)：
+ *   - v4.2 只修了 IP 累积（表象），真正根因是非分页池耗尽：
+ *     1. RandomizeMac 每次 disable/enable 网卡 → TCP/IP 栈完全重建
+ *        → 消耗大量非分页池内存（NDIS buffer pools、ARP tables）
+ *     2. 每次老板键切换 = 2次网卡周期（进+出）+ ~20-30个进程
+ *        → 内核内存碎片化
+ *     3. IPGuardThread 级联恢复：网卡刚重置还不稳定 → 发现"IP丢失"
+ *        → 生成10-25个进程尝试恢复 → 更多压力 → 恶性循环
+ *     4. EmergencyNetworkFix 绕过自旋锁（InterlockedExchange 强制设1）
+ *        → 和正在执行的 SetIPBoss/SetIPWork 冲突 → 两次 disable/enable
+ *        同时进行 → 双倍非分页池消耗
+ *     5. 适配器名称缓存（g_szAdapter）在网卡重置后从不刷新
+ *        → Windows 可能重命名适配器 → 后续 netsh 命令静默失败
+ *     6. ExecPowerShellWithOutput 缓冲区只有 1024 字节
+ *        → IP 多时截断 → ClearAccumulatedIPs 无法完全清理
+ *     7. WriteLog 无锁 → 4个线程并发写日志 → 文件句柄竞争
  *   - 修复方案：
- *     1. 新增 ClearAccumulatedIPs()：通过 PowerShell 枚举适配器上所有IP，
- *        用 netsh delete address 逐个清除残留静态IP
- *     2. SetIPBoss/SetIPWork：RandomizeMac 后立即调用 ClearAccumulatedIPs
- *     3. ApplyIP：开头调用 ClearAccumulatedIPs（双保险）
- *     4. ApplyIP：第二IP先 delete 再 add，不再只 add 不 delete
- *     5. IPGuardThread：检查间隔 5秒→15秒，重试等待 15秒→30秒
- *     6. EmergencyNetworkFix：网卡启用后也调用 ClearAccumulatedIPs
- *   - 对比 AppHider：AppHider 不做 MAC 随机化、不追加 IP、不频繁
- *     disable/enable 网卡，所以从未出现此问题
+ *     1. RandomizeMac 增加 3 分钟冷却计时器（g_dwLastMacRandomizeTick）
+ *        → 冷却期内跳过，避免反复禁用/启用网卡
+ *     2. ExecPowerShellWithOutput 缓冲区 1024 → 16384
+ *        → 确保 ClearAccumulatedIPs 能读到所有IP
+ *     3. RandomizeMac/EmergencyNetworkFix 后使 g_szAdapter[0]=0
+ *        → 下次 GetAdapterName() 重新枚举，获取最新名称
+ *     4. WriteLog 增加 CRITICAL_SECTION 互斥锁
+ *        → 防止多线程并发写日志导致句柄泄漏
+ *     5. EmergencyNetworkFix 改用 BeginNetworkChange() 正确获取锁
+ *        → 不再绕过自旋锁，防止和 SetIPBoss/SetIPWork 冲突
+ *     6. IPGuardThread 增加 60 秒冷却（g_dwLastNetworkResetTick）
+ *        → 网卡重置后 60 秒内不触发恢复，避免级联崩溃
+ *     7. EmergencyNetworkFix 也记录时间戳并使适配器缓存失效
+ *
+ * v4.2 修复 IP 累积（部分有效，但不足以解决问题）：
+ *   - 新增 ClearAccumulatedIPs()、第二IP先删后加、增大检查间隔
  *
  * v3.3 新增：隐私保险箱（VHDX/BitLocker 伪装文件挂载）
  *   - 支持选择 .lvm（实为 .vhdx）伪装文件
@@ -156,6 +173,24 @@ static volatile BOOL g_bLocked   = FALSE;
 static volatile LONG g_lNetworkChangeBusy = 0;
 static volatile LONG g_lEmergencyFixBusy  = 0;
 static volatile BOOL g_bEnableMacRandomization = TRUE;  /* 每次切换IP时自动随机更换MAC地址 */
+
+/* v4.3: 网卡操作冷却计时 — 防止反复禁用/启用网卡耗尽非分页池
+ * 每次 RandomizeMac 执行后记录时间戳，后续调用若在冷却期内则跳过。
+ * 这是修复 ERR_NO_BUFFER_SPACE 的核心：每次 disable/enable 网卡会
+ * 导致 Windows TCP/IP 栈完全重建，消耗大量非分页池内存。
+ * 3分钟内不重复操作，给系统足够时间回收资源。 */
+static volatile LONG g_dwLastMacRandomizeTick = 0;
+#define MAC_COOLDOWN_MS (180 * 1000)  /* 3分钟冷却 */
+
+/* v4.3: IPGuard 冷却 — RandomizeMac 后60秒内不触发IP恢复 */
+static volatile LONG g_dwLastNetworkResetTick = 0;
+#define IPGUARD_COOLDOWN_MS (60 * 1000)  /* 60秒冷却 */
+
+/* v4.3: WriteLog 线程安全锁 — WatchdogThread/GuardThread/IPGuardThread/BossKeyThread
+ * 都并发调用 WriteLog，无锁时多个线程同时 CreateFile/WriteFile 会导致
+ * 文件句柄泄漏和缓冲区竞争，增加内核对象压力。 */
+static CRITICAL_SECTION g_csLog;
+static volatile BOOL g_bLogInitialized = FALSE;
 
 /* 配置 */
 static WCHAR g_szLoginPwd[64]   = DEFAULT_LOGIN_PWD;
@@ -368,6 +403,13 @@ static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param) {
    WriteLog（调试日志，写到 %TEMP%\bosstool.log）
    ============================================================ */
 static void WriteLog(const WCHAR *fmt, ...) {
+    /* v4.3: 加锁保护 — 多线程并发写日志会导致文件句柄竞争 */
+    if (!g_bLogInitialized) {
+        InitializeCriticalSection(&g_csLog);
+        g_bLogInitialized = TRUE;
+    }
+    EnterCriticalSection(&g_csLog);
+
     WCHAR buf[1024];
     va_list va;
     va_start(va, fmt);
@@ -379,7 +421,8 @@ static void WriteLog(const WCHAR *fmt, ...) {
     GetTempPathW(MAX_PATH, szPath);
     wcsncat(szPath, L"bosstool.log", MAX_PATH - wcslen(szPath) - 1);
 
-    HANDLE hFile = CreateFileW(szPath, GENERIC_WRITE, FILE_SHARE_READ,
+    HANDLE hFile = CreateFileW(szPath, GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
                                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
         SetFilePointer(hFile, 0, NULL, FILE_END);
@@ -389,10 +432,11 @@ static void WriteLog(const WCHAR *fmt, ...) {
                    st.wHour, st.wMinute, st.wSecond, buf);
         line[1199] = 0;
         DWORD written;
-        /* 写 UTF-16 LE（Windows HANDLE 写入宽字符） */
         WriteFile(hFile, line, (DWORD)(wcslen(line)*sizeof(WCHAR)), &written, NULL);
         CloseHandle(hFile);
     }
+
+    LeaveCriticalSection(&g_csLog);
 }
 
 /* ============================================================
@@ -567,8 +611,11 @@ static BOOL ExecPowerShellWithOutput(const WCHAR *psScript, WCHAR *outBuf, int o
         return FALSE;
     }
 
-    /* 读取输出（ANSI） */
-    char ansiOut[1024] = {0};
+    /* 读取输出（ANSI）
+     * v4.3: 缓冲区从 1024 扩大到 16384。
+     * 当适配器上累积了大量IP时，PowerShell 输出可能超过 1024 字节，
+     * 导致 ClearAccumulatedIPs 只能读到部分IP，无法完全清理。 */
+    char ansiOut[16384] = {0};
     DWORD bytesRead = 0, totalRead = 0;
     while (totalRead < (DWORD)sizeof(ansiOut)-1) {
         DWORD avail = 0;
@@ -1225,8 +1272,15 @@ static void EmergencyNetworkFix(void) {
        3. 确保DNS服务运行
        ============================================================ */
 
-    /* 步骤0: 强制锁定，不等待（紧急修复优先级最高） */
-    InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 1);
+    /* v4.3: 步骤0: 使用 BeginNetworkChange 正确获取锁。
+     * 之前用 InterlockedExchange 强制设置 g_lNetworkChangeBusy=1，
+     * 会绕过自旋锁保护，导致和正在执行的 SetIPBoss/SetIPWork 冲突，
+     * 造成两次 disable/enable 同时进行 → 双倍非分页池消耗。
+     * 现在改为正确等待锁释放（最多120秒），紧急修复也遵守互斥。 */
+    if (!BeginNetworkChange()) {
+        WriteLog(L"EmergencyNetworkFix: 获取锁超时，放弃");
+        return;
+    }
 
     const WCHAR *adpName = GetAdapterName();
     WCHAR args[1024];
@@ -1251,6 +1305,11 @@ static void EmergencyNetworkFix(void) {
         adpName);
     RunNetshDirect(args);
     Sleep(3000);  /* 等待网卡完全就绪 */
+
+    /* v4.3: 使适配器名称缓存失效（同 RandomizeMac 中的处理） */
+    g_szAdapter[0] = 0;
+    /* v4.3: 记录操作时间戳，防止 IPGuardThread 级联恢复 */
+    InterlockedExchange(&g_dwLastNetworkResetTick, (LONG)GetTickCount());
 
     /* ----------------------------------------------------------
        步骤2.5: v4.2 清理网卡上所有残留IP
@@ -1300,7 +1359,7 @@ static void EmergencyNetworkFix(void) {
     Sleep(500);
 
     /* 步骤5: 恢复 IPGuard */
-    InterlockedExchange((LONG*)&g_lNetworkChangeBusy, 0);
+    EndNetworkChange();
 }
 
 DWORD WINAPI EmergencyFixThread(LPVOID p) {
@@ -1516,6 +1575,18 @@ static DWORD GetEthernetIfIndex(void) {
 }
 
 static void RandomizeMac(void) {
+    /* v4.3: 冷却检查 — 防止短时间内反复禁用/启用网卡
+     * 每次 disable/enable 会让 Windows TCP/IP 栈完全重建，
+     * 消耗大量非分页池内存（NDIS buffer pools、ARP tables 等）。
+     * 如果冷却期未到，直接跳过，避免资源耗尽。 */
+    DWORD dwNow = GetTickCount();
+    DWORD dwLast = (DWORD)g_dwLastMacRandomizeTick;
+    if (dwLast != 0 && (dwNow - dwLast) < (DWORD)MAC_COOLDOWN_MS) {
+        WriteLog(L"RandomizeMac: 冷却中（距上次 %lu 秒），跳过",
+                 (dwNow - dwLast) / 1000);
+        return;
+    }
+
     srand((unsigned)(GetTickCount() ^ (DWORD)(ULONG_PTR)&RandomizeMac ^ GetCurrentProcessId()));
     BYTE mac[6];
     mac[0] = 0x02;
@@ -1603,6 +1674,15 @@ static void RandomizeMac(void) {
         adpName);
     RunNetshDirect(args);
     Sleep(2000);
+
+    /* v4.3: 记录操作时间戳（供 IPGuardThread 冷却判断） */
+    InterlockedExchange(&g_dwLastMacRandomizeTick, (LONG)GetTickCount());
+    InterlockedExchange(&g_dwLastNetworkResetTick, (LONG)GetTickCount());
+
+    /* v4.3: 使适配器名称缓存失效。
+     * 禁用/启用网卡后，Windows 可能重新命名适配器（如 "以太网 2"），
+     * 旧缓存名称会导致后续 netsh 命令静默失败。 */
+    g_szAdapter[0] = 0;
 }
 
 /* netsh 直接调用 */
@@ -1828,10 +1908,33 @@ DWORD WINAPI IPGuardThread(LPVOID p) {
         Sleep(15000);  /* v4.2: 5秒→15秒，减少 GetAdaptersInfo 调用和网络栈压力 */
         if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
         if (g_lNetworkChangeBusy) continue;
+
+        /* v4.3: 冷却检查 — RandomizeMac 后60秒内不触发IP恢复。
+         * 网卡刚禁用/启用后，TCP/IP 栈还在重建中，此时检查IP
+         * 会发现"IP丢失"→ 触发大量 netsh/PowerShell 进程 → 级联崩溃。
+         * 等待60秒让网络栈完全稳定后再检查。 */
+        {
+            DWORD dwNow = GetTickCount();
+            DWORD dwReset = (DWORD)g_dwLastNetworkResetTick;
+            if (dwReset != 0 && (dwNow - dwReset) < (DWORD)IPGUARD_COOLDOWN_MS) {
+                continue;  /* 冷却中，跳过本次检查 */
+            }
+        }
+
         if (!AdapterHasIP(g_szExpectedIP)) {
             Sleep(30000);  /* v4.2: 15秒→30秒，给适配器更多恢复时间 */
             if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
             if (g_lNetworkChangeBusy || AdapterHasIP(g_szExpectedIP)) continue;
+
+            /* v4.3: 再次检查冷却（30秒等待期间可能已满足冷却条件） */
+            {
+                DWORD dwNow = GetTickCount();
+                DWORD dwReset = (DWORD)g_dwLastNetworkResetTick;
+                if (dwReset != 0 && (dwNow - dwReset) < (DWORD)IPGUARD_COOLDOWN_MS) {
+                    continue;
+                }
+            }
+
             /* v3.3.4: 用 BeginNetworkChange 保护，防止和 EmergencyFix 冲突 */
             if (!BeginNetworkChange()) continue;
             WriteLog(L"IPGuardThread: IP 丢失，清理残留后重新应用");
