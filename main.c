@@ -2349,13 +2349,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
      * 之前只触发锁屏，用户还需手动按老板键。
      * 现在一步到位：Win+L = 进入老板模式 + 锁屏。 */
     if (!g_bLocked && bDown && bWin && vk == 'L') {
-        /* v4.4: 直接调用 DoBossKey，不经过消息队列。
-         * DoBossKey 只设标志+启动线程，不会阻塞键盘钩子。
-         * 之前用 PostMessageW 可能因消息时序问题导致老板键未激活。 */
-        if (!g_bBossMode) {
-            DoBossKey();
-        }
-        /* 显示 Ubuntu 伪装锁屏 */
+        /* v4.4: Win+L = 老板键切换 + Ubuntu 锁屏。
+         * DoBossKey 是 toggle：
+         *   不在老板模式 → 进入（切老板IP、隐藏窗口、挂载VHDX、开记事本）
+         *   已在老板模式 → 退出（恢复工作IP、卸载VHDX、显示窗口）
+         * 用户场景：老板来了 → 按 Win+L 退出老板模式+锁屏 →
+         * 老板走了 → 解锁 → 手动按老板键恢复。 */
+        DoBossKey();
         PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
         return 1;
     }
@@ -2758,13 +2758,6 @@ static void DoUnlockScreen(void) {
     HWND hDesktop = GetDesktopWindow();
     SetForegroundWindow(hDesktop);
 
-    /* v4.4: 解锁时自动退出老板模式。
-     * 用户场景：老板来了 → 按老板键进入老板模式 → 按 Win+L 锁屏 →
-     * 老板走了 → 解锁 → 自动恢复工作模式（切回工作IP、卸载VHDX、显示窗口）。
-     * DoBossKey() 检测到 g_bBossMode==TRUE 时会执行退出流程。 */
-    if (g_bBossMode) {
-        DoBossKey();
-    }
 }
 
 /* ============================================================
