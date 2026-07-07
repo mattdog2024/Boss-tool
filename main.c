@@ -2349,10 +2349,11 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
      * 之前只触发锁屏，用户还需手动按老板键。
      * 现在一步到位：Win+L = 进入老板模式 + 锁屏。 */
     if (!g_bLocked && bDown && bWin && vk == 'L') {
-        /* 吃掉 Win+L，不传递给系统 */
-        /* v4.4: 如果还没进入老板模式，先触发老板键 */
+        /* v4.4: 直接调用 DoBossKey，不经过消息队列。
+         * DoBossKey 只设标志+启动线程，不会阻塞键盘钩子。
+         * 之前用 PostMessageW 可能因消息时序问题导致老板键未激活。 */
         if (!g_bBossMode) {
-            PostMessageW(g_hWndMain, WM_BOSS_KEY, 0, 0);
+            DoBossKey();
         }
         /* 显示 Ubuntu 伪装锁屏 */
         PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
