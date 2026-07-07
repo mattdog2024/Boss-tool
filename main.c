@@ -2757,6 +2757,14 @@ static void DoUnlockScreen(void) {
     g_bShowInput=FALSE;
     HWND hDesktop = GetDesktopWindow();
     SetForegroundWindow(hDesktop);
+
+    /* v4.4: 解锁时自动退出老板模式。
+     * 用户场景：老板来了 → 按老板键进入老板模式 → 按 Win+L 锁屏 →
+     * 老板走了 → 解锁 → 自动恢复工作模式（切回工作IP、卸载VHDX、显示窗口）。
+     * DoBossKey() 检测到 g_bBossMode==TRUE 时会执行退出流程。 */
+    if (g_bBossMode) {
+        DoBossKey();
+    }
 }
 
 /* ============================================================
