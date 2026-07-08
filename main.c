@@ -1,5 +1,5 @@
 /*
- * BossTool v4.8 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.9 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      4    /* v4.8: 配置版本号，修复 Ctrl+Win+Alt 重置逻辑 */
+#define CONFIG_VERSION      5    /* v4.9: 配置版本号，彻底修复 Ctrl+Win+Alt 时序问题 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -197,8 +197,14 @@ static volatile LONG g_dwLastMacRandomizeTick = 0;
 static volatile LONG g_dwLastNetworkResetTick = 0;
 #define IPGUARD_COOLDOWN_MS (60 * 1000)  /* 60秒冷却 */
 
-/* v4.7: 纯修饰键组合（Ctrl+Win+Alt）触发状态 — 防止按键重复多次触发 */
+/* v4.9: 纯修饰键组合（Ctrl+Win+Alt）触发状态
+ * 使用局部状态变量跟踪修饰键，而不依赖 GetAsyncKeyState。
+ * 原因：在低级键盘钩子回调中，GetAsyncKeyState 可能存在时序问题，
+ * 尤其是 Alt 键（触发 WM_SYSKEYDOWN）按下时可能还没有更新。 */
 static volatile BOOL s_bBossComboTriggered = FALSE;
+static volatile BOOL s_bModCtrl = FALSE;  /* Ctrl 键当前状态 */
+static volatile BOOL s_bModWin  = FALSE;  /* Win  键当前状态 */
+static volatile BOOL s_bModAlt  = FALSE;  /* Alt  键当前状态 */
 
 /* v4.3: WriteLog 线程安全锁 — WatchdogThread/GuardThread/IPGuardThread/BossKeyThread
  * 都并发调用 WriteLog，无锁时多个线程同时 CreateFile/WriteFile 会导致
@@ -2394,55 +2400,47 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lParam;
     UINT vk = kb->vkCode;
     BOOL bDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-    BOOL bCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    BOOL bAlt  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
-    BOOL bWin  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
-                 (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
 
-    /* v4.4: 拦截 Win+L，同时激活老板键 + Ubuntu 伪装锁屏。
-     * 之前只触发锁屏，用户还需手动按老板键。
-     * 现在一步到位：Win+L = 进入老板模式 + 锁屏。 */
+    /* v4.9: 用局部状态变量跟踪修饰键状态，而不依赖 GetAsyncKeyState。
+     * GetAsyncKeyState 在低级键盘钩子回调中存在时序问题：
+     * 当 Alt 键触发 WM_SYSKEYDOWN 时，GetAsyncKeyState(VK_MENU) 可能还没有更新，
+     * 导致三键同时按下时判断失败。 */
+    if (vk == VK_LCONTROL || vk == VK_RCONTROL) {
+        s_bModCtrl = bDown;
+        if (!bDown) s_bBossComboTriggered = FALSE;
+    } else if (vk == VK_LMENU || vk == VK_RMENU) {
+        s_bModAlt = bDown;
+        if (!bDown) s_bBossComboTriggered = FALSE;
+    } else if (vk == VK_LWIN || vk == VK_RWIN) {
+        s_bModWin = bDown;
+        if (!bDown) s_bBossComboTriggered = FALSE;
+    }
+
+    /* 以下依然使用 GetAsyncKeyState 用于 Win+L 拦截和锁屏输入 */
+    BOOL bCtrl = s_bModCtrl;
+    BOOL bAlt  = s_bModAlt;
+    BOOL bWin  = s_bModWin;
+
+    /* v4.4: 拦截 Win+L，同时激活老板键 + Ubuntu 伪装锁屏。 */
     if (!g_bLocked && bDown && bWin && vk == 'L') {
-        /* v4.4: Win+L = 仅退出老板模式 + Ubuntu 锁屏（不进入老板模式）。
-         * 用户场景：老板来了 → 已在老板模式 → 按 Win+L 退出老板模式+锁屏 →
-         * 老板走了 → 解锁 → 手动按 Ctrl+Win+Alt 恢复。
-         * 若不在老板模式，Win+L 仅锁屏，不触发老板键。 */
         if (g_bBossMode) DoBossKey();
         PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
         return 1;
     }
 
-    /* v4.8: Ctrl+Win+Alt 三键同时按下即触发老板键，无需额外字母键。
-     * RegisterHotKey 无法注册纯修饰键组合，必须用低级键盘钩子实现。
-     *
-     * 修复 v4.7 的两个 bug：
-     * [Bug1] 重置条件太严格：原来要三个键全部同时松开才重置，实际上几乎不可能同时发生，
-     *         导致 s_bBossComboTriggered 永远为 TRUE，第二次按无效。
-     *         修复：任意一个修饰键松开就重置标志。
-     * [Bug2] Win键松开时若无其他键被按，Windows 会弹出开始菜单。
-     *         修复：在 Ctrl 或 Alt 也按着时，吃掉 Win 键的事件防止开始菜单弹出。 */
+    /* v4.9: Ctrl+Win+Alt 三键同时按下即触发老板键。
+     * 完全使用局部状态变量，不再依赖 GetAsyncKeyState，彻底解决时序问题。
+     * 三键中任意一键按下时，检查另两键是否已按着，满足则触发。
+     * 同时吃掉 Win 键事件防止开始菜单弹出。 */
     if (g_BossMod == DEFAULT_BOSS_MOD) {
-        BOOL bCtrlNow = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        BOOL bAltNow  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
-        BOOL bWinNow  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
-                        (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
-
+        /* 吃掉 Win 键事件（防开始菜单）：当 Ctrl 或 Alt 按着时 */
+        if ((vk == VK_LWIN || vk == VK_RWIN) && (bCtrl || bAlt)) {
+            return 1;
+        }
         /* 三键同时按下 → 触发老板键 */
-        if (bDown && bCtrlNow && bWinNow && bAltNow && !s_bBossComboTriggered) {
+        if (bDown && s_bModCtrl && s_bModWin && s_bModAlt && !s_bBossComboTriggered) {
             s_bBossComboTriggered = TRUE;
             DoBossKey();
-            return 1;  /* 吃掉按键，不传递给系统 */
-        }
-
-        /* v4.8 [Bug1] 修复：任意修饰键松开就重置，不要等三键全部同时松开 */
-        if (!bDown && (vk == VK_LCONTROL || vk == VK_RCONTROL ||
-                       vk == VK_LMENU    || vk == VK_RMENU    ||
-                       vk == VK_LWIN     || vk == VK_RWIN)) {
-            s_bBossComboTriggered = FALSE;
-        }
-
-        /* v4.8 [Bug2] 修复：在 Ctrl 或 Alt 按着时，吃掉 Win 键事件，防止开始菜单弹出 */
-        if ((vk == VK_LWIN || vk == VK_RWIN) && (bCtrlNow || bAltNow)) {
             return 1;
         }
     }
@@ -2986,7 +2984,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         SendMessage(h,CB_SETCURSEL,selM,0);
         y+=28;
 
-        /* 老板键按键 */
+        /* 老板键按键（当选择 Ctrl+Win+Alt 时该框无效） */
         h=CreateWindowW(L"STATIC",L"老板键(字母/数字):",
             WS_CHILD|WS_VISIBLE,8,y,130,20,hWnd,NULL,g_hInst,NULL);
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
@@ -2996,6 +2994,11 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             145,y,50,22,hWnd,(HMENU)IDC_SET_BVK,g_hInst,NULL);
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
         SendMessage(h,EM_SETLIMITTEXT,1,0);
+        /* v4.9: 当选择 Ctrl+Win+Alt 时，字母键无效，禁用输入框 */
+        if (g_BossMod == DEFAULT_BOSS_MOD) {
+            EnableWindow(h, FALSE);
+            SetDlgItemTextW(hWnd, IDC_SET_BVK, L"-");
+        }
         y+=28;
 
         /* 开机自启 */
@@ -3133,6 +3136,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             VaultMount(hWnd);
         } else if(id==IDC_VAULT_EJECT) {
             VaultEject(hWnd);
+        } else if(HIWORD(wParam)==CBN_SELCHANGE && id==IDC_SET_BMOD) {
+            /* v4.9: 下拉菜单切换时实时更新字母键输入框状态 */
+            int selNow=(int)SendDlgItemMessageW(hWnd,IDC_SET_BMOD,CB_GETCURSEL,0,0);
+            HWND hVk=GetDlgItem(hWnd,IDC_SET_BVK);
+            if(selNow>=0 && selNow<5 && g_nModVals[selNow]==DEFAULT_BOSS_MOD) {
+                EnableWindow(hVk, FALSE);
+                SetDlgItemTextW(hWnd, IDC_SET_BVK, L"-");
+            } else {
+                EnableWindow(hVk, TRUE);
+                WCHAR szVkTmp[4]={(WCHAR)g_BossVk,0};
+                SetDlgItemTextW(hWnd, IDC_SET_BVK, szVkTmp);
+            }
         } else if(id==IDC_SET_SAVE) {
             /* 读取所有设置 */
             GetDlgItemTextW(hWnd,IDC_SET_LPWD,g_szLoginPwd,63);
@@ -3141,9 +3156,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             int sel=(int)SendDlgItemMessageW(hWnd,IDC_SET_BMOD,CB_GETCURSEL,0,0);
             if(sel>=0&&sel<5) g_BossMod=g_nModVals[sel];
             WCHAR szVk[4]={0};
-            GetDlgItemTextW(hWnd,IDC_SET_BVK,szVk,3);
-            if((szVk[0]>='A'&&szVk[0]<='Z')||(szVk[0]>='0'&&szVk[0]<='9'))
-                g_BossVk=szVk[0];
+            /* v4.9: 当选择 Ctrl+Win+Alt 时，字母键不读取（无效） */
+            if(g_BossMod != DEFAULT_BOSS_MOD) {
+                GetDlgItemTextW(hWnd,IDC_SET_BVK,szVk,3);
+                if((szVk[0]>='A'&&szVk[0]<='Z')||(szVk[0]>='0'&&szVk[0]<='9'))
+                    g_BossVk=szVk[0];
+            }
             g_bAutoRun=(SendDlgItemMessage(hWnd,IDC_SET_AR,BM_GETCHECK,0,0)==BST_CHECKED);
             BOOL bAllow=(SendDlgItemMessage(hWnd,IDC_SET_ALLOWIP,BM_GETCHECK,0,0)==BST_CHECKED);
             if(bAllow != g_bAllowIPChange) {
@@ -3203,9 +3221,16 @@ static void ShowSettingsWindow(void) {
         SetDlgItemTextW(g_hWndSettings,IDC_SET_SPWD,g_szLockPwd);
         SetDlgItemTextW(g_hWndSettings,IDC_SET_HL,g_szHideList);
         WCHAR szVk[4]={(WCHAR)g_BossVk,0};
-        SetDlgItemTextW(g_hWndSettings,IDC_SET_BVK,szVk);
+        /* v4.9: 当选择 Ctrl+Win+Alt 时禁用字母键输入框 */
+        if (g_BossMod == DEFAULT_BOSS_MOD) {
+            SetDlgItemTextW(g_hWndSettings,IDC_SET_BVK,L"-");
+            EnableWindow(GetDlgItem(g_hWndSettings,IDC_SET_BVK), FALSE);
+        } else {
+            SetDlgItemTextW(g_hWndSettings,IDC_SET_BVK,szVk);
+            EnableWindow(GetDlgItem(g_hWndSettings,IDC_SET_BVK), TRUE);
+        }
         int selM=0;
-        for(int i=0;i<5;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;}
+        for(int i=0;i<5;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;};
         SendDlgItemMessageW(g_hWndSettings,IDC_SET_BMOD,CB_SETCURSEL,selM,0);
         SendDlgItemMessage(g_hWndSettings,IDC_SET_AR,BM_SETCHECK,
                            g_bAutoRun?BST_CHECKED:BST_UNCHECKED,0);
