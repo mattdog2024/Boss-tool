@@ -1,5 +1,5 @@
 /*
- * BossTool v4.11 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.12 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      7    /* v4.11: 配置版本号，进程保护+伪装 */
+#define CONFIG_VERSION      8    /* v4.12: 修复锁屏闪烁+进程保护锁死自己 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -1411,28 +1411,26 @@ static void ProtectProcess(void) {
         CloseHandle(hToken);
     }
 
-    /* v4.11: 第二步：修改自身进程的 DACL，删除 PROCESS_TERMINATE 权限
-     * 原理：任务管理器结束进程时调用 OpenProcess(PROCESS_TERMINATE,...)
-     * 如果 DACL 里没有授予 PROCESS_TERMINATE，这个调用会失败，进程无法被结束
-     * 注意：开启了 SeDebugPrivilege 的管理员仍可绕过，但普通任务管理器不行 */
+    /* v4.12: 第二步：修改自身进程的 DACL
+     * 策略：只拒绝 "Users" 组（普通用户）的 PROCESS_TERMINATE
+     *         管理员组不受限制，依然可以用专用工具结束进程
+     * v4.11 的错误：拒绝 Everyone 把管理员自己也锁死了 */
     {
         HANDLE hProc = GetCurrentProcess();
         PSECURITY_DESCRIPTOR pSD = NULL;
         PACL pOldDacl = NULL;
-        /* 获取当前进程的安全描述符 */
         if (GetSecurityInfo(hProc, SE_KERNEL_OBJECT,
                             DACL_SECURITY_INFORMATION,
                             NULL, NULL, &pOldDacl, NULL, &pSD) == ERROR_SUCCESS) {
-            /* 构建一个新 ACL：在原有 DACL 基础上，添加一条拒绝规则 */
             EXPLICIT_ACCESS_W ea[1];
             ZeroMemory(ea, sizeof(ea));
-            /* 拒绝 Everyone 组 PROCESS_TERMINATE + PROCESS_VM_WRITE + PROCESS_VM_OPERATION */
+            /* 只拒绝 Users 组（普通用户），不拒绝 Administrators */
             ea[0].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
             ea[0].grfAccessMode        = DENY_ACCESS;
             ea[0].grfInheritance       = NO_INHERITANCE;
             ea[0].Trustee.TrusteeForm  = TRUSTEE_IS_NAME;
             ea[0].Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
-            ea[0].Trustee.ptstrName    = (LPWSTR)L"Everyone";
+            ea[0].Trustee.ptstrName    = (LPWSTR)L"Users";
             PACL pNewDacl = NULL;
             if (SetEntriesInAclW(1, ea, pOldDacl, &pNewDacl) == ERROR_SUCCESS) {
                 SetSecurityInfo(hProc, SE_KERNEL_OBJECT,
@@ -1465,12 +1463,10 @@ static void KillBypassWindows(void) {
     if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
     /* LogonUI （按 Ctrl+Alt+Del 后弹出的登录界面） */
     ExecHidden(L"taskkill /f /im LogonUI.exe");
-    /* 重新将锁屏窗口置顶并激活 */
+    /* v4.12: 只做 TOPMOST 置顶，去掉 SetForegroundWindow，防止闪烁 */
     if (g_hWndLock && IsWindow(g_hWndLock)) {
         SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        SetForegroundWindow(g_hWndLock);
-        BringWindowToTop(g_hWndLock);
     }
 }
 DWORD WINAPI WatchdogThread(LPVOID p) {
@@ -1489,25 +1485,15 @@ DWORD WINAPI WatchdogThread(LPVOID p) {
    ============================================================ */
 DWORD WINAPI GuardThread(LPVOID p) {
     (void)p;
-    static DWORD s_dwLastForce = 0;
     while (1) {
-        Sleep(200);  /* v4.10: 缩短到 200ms */
+        Sleep(500);
+        /* v4.12: 只做 TOPMOST 置顶，不强制抢前景。
+         * v4.10/v4.11 的 SetForegroundWindow 每秒强制激活导致屏幕疯狂闪烁，
+         * 原因：系统和我们的窗口互相投票激活，就像两个人疯狂抢遥控器。
+         * TOPMOST 标志已经足够确保锁屏窗口在所有普通窗口之上。 */
         if (g_bLocked && g_hWndLock && IsWindow(g_hWndLock)) {
-            /* 始终保持 TOPMOST */
             SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            /* v4.10: 每 1 秒强制将锁屏窗口拉到前景，
-             * 防止 Ctrl+Alt+Del 后系统界面覆盖锁屏 */
-            DWORD now = GetTickCount();
-            if (now - s_dwLastForce >= 1000) {
-                s_dwLastForce = now;
-                HWND hFg = GetForegroundWindow();
-                if (hFg != g_hWndLock) {
-                    /* 当前前景不是锁屏窗口，强制激活 */
-                    SetForegroundWindow(g_hWndLock);
-                    BringWindowToTop(g_hWndLock);
-                }
-            }
         }
     }
     return 0;
