@@ -1,5 +1,5 @@
 /*
- * BossTool v4.9 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.10 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      5    /* v4.9: 配置版本号，彻底修复 Ctrl+Win+Alt 时序问题 */
+#define CONFIG_VERSION      6    /* v4.10: 配置版本号，修复锁屏输入和 Ctrl+Alt+Del 绕过 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -1414,16 +1414,37 @@ static void ProtectProcess(void) {
 /* ============================================================
    看门狗线程
    ============================================================ */
+/* v4.10: 关闭绕过锁屏的窗口并重新激活锁屏 */
+static void KillBypassWindows(void) {
+    /* 任务管理器 */
+    HWND h = FindWindowW(L"TaskManagerWindow", NULL);
+    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
+    h = FindWindowW(L"#32770", L"Windows 任务管理器");
+    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
+    /* Ctrl+Alt+Del 安全界面（Windows 10/11） */
+    h = FindWindowW(L"Windows.UI.Core.CoreWindow", NULL);
+    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
+    /* 注销/切换用户界面 */
+    h = FindWindowW(L"#32770", L"注销");
+    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
+    h = FindWindowW(L"#32770", L"切换用户");
+    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
+    /* LogonUI （按 Ctrl+Alt+Del 后弹出的登录界面） */
+    ExecHidden(L"taskkill /f /im LogonUI.exe");
+    /* 重新将锁屏窗口置顶并激活 */
+    if (g_hWndLock && IsWindow(g_hWndLock)) {
+        SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(g_hWndLock);
+        BringWindowToTop(g_hWndLock);
+    }
+}
 DWORD WINAPI WatchdogThread(LPVOID p) {
     (void)p;
     while (1) {
-        Sleep(2000);
+        Sleep(300);  /* v4.10: 缩短间隔到 300ms，更快响应 Ctrl+Alt+Del */
         if (g_bLocked) {
-            HWND h;
-            h = FindWindowW(L"TaskManagerWindow", NULL);
-            if (h) PostMessage(h, WM_CLOSE, 0, 0);
-            h = FindWindowW(L"#32770", L"Windows 任务管理器");
-            if (h) PostMessage(h, WM_CLOSE, 0, 0);
+            KillBypassWindows();
         }
     }
     return 0;
@@ -1434,11 +1455,25 @@ DWORD WINAPI WatchdogThread(LPVOID p) {
    ============================================================ */
 DWORD WINAPI GuardThread(LPVOID p) {
     (void)p;
+    static DWORD s_dwLastForce = 0;
     while (1) {
-        Sleep(500);
+        Sleep(200);  /* v4.10: 缩短到 200ms */
         if (g_bLocked && g_hWndLock && IsWindow(g_hWndLock)) {
+            /* 始终保持 TOPMOST */
             SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
                          SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            /* v4.10: 每 1 秒强制将锁屏窗口拉到前景，
+             * 防止 Ctrl+Alt+Del 后系统界面覆盖锁屏 */
+            DWORD now = GetTickCount();
+            if (now - s_dwLastForce >= 1000) {
+                s_dwLastForce = now;
+                HWND hFg = GetForegroundWindow();
+                if (hFg != g_hWndLock) {
+                    /* 当前前景不是锁屏窗口，强制激活 */
+                    SetForegroundWindow(g_hWndLock);
+                    BringWindowToTop(g_hWndLock);
+                }
+            }
         }
     }
     return 0;
@@ -2454,13 +2489,28 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
                     PostMessage(g_hWndLock, WM_KEYDOWN, VK_ESCAPE, 0);
                 } else if (vk == VK_BACK) {
                     PostMessage(g_hWndLock, WM_KEYDOWN, VK_BACK, 0);
-                } else if (!bCtrl && !bAlt && !bWin) {
-                    BYTE keyState[256] = {0};
-                    GetKeyboardState(keyState);
-                    WCHAR wchars[4] = {0};
-                    int nChars = ToUnicode(vk, kb->scanCode, keyState, wchars, 3, 0);
-                    if (nChars == 1 && wchars[0] >= 32 && wchars[0] != 127)
-                        PostMessage(g_hWndLock, WM_CHAR, (WPARAM)wchars[0], 0);
+                } else {
+                    /* v4.10: 锁屏状态下用 GetAsyncKeyState 实时查询修饰键状态，
+                     * 而不用 s_bModCtrl/Alt/Win 状态变量。
+                     * 原因：用户按 Ctrl+Win+Alt 触发锁屏后，三键还没完全松开时
+                     * s_bModCtrl/Win/Alt 仍为 TRUE，导致密码字符被过滤。
+                     * 在锁屏状态下 GetAsyncKeyState 的时序问题不影响密码输入，
+                     * 因为密码键不是修饰键，不依赖 WM_SYSKEYDOWN。 */
+                    BOOL bCtrlNow = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+                    BOOL bAltNow  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+                    BOOL bWinNow  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
+                                   (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
+                    if (!bCtrlNow && !bAltNow && !bWinNow) {
+                        /* 构造一个干净的键盘状态（只保留 Shift/CapsLock），
+                         * 避免 Alt 键尚未完全释放时 ToUnicode 输出异常字符 */
+                        BYTE keyState[256] = {0};
+                        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) keyState[VK_SHIFT] = 0x80;
+                        if (GetKeyState(VK_CAPITAL) & 1)         keyState[VK_CAPITAL] = 0x01;
+                        WCHAR wchars[4] = {0};
+                        int nChars = ToUnicode(vk, kb->scanCode, keyState, wchars, 3, 0);
+                        if (nChars == 1 && wchars[0] >= 32 && wchars[0] != 127)
+                            PostMessage(g_hWndLock, WM_CHAR, (WPARAM)wchars[0], 0);
+                    }
                 }
             }
         }
@@ -2802,6 +2852,18 @@ static void DoLockScreen(void) {
     SystemParametersInfoW(SPI_SETSCREENSAVERRUNNING, TRUE, NULL, 0);
     ExecHidden(L"taskkill /f /im LockApp.exe");
     ExecHidden(L"taskkill /f /im LogonUI.exe");
+    /* v4.10: 锁屏时禁用任务管理器和注销，防止 Ctrl+Alt+Del 绕过 */
+    {
+        HKEY hKey;
+        if (RegCreateKeyExW(HKEY_CURRENT_USER,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
+            DWORD val = 1;
+            RegSetValueExW(hKey, L"DisableTaskMgr", 0, REG_DWORD, (LPBYTE)&val, sizeof(val));
+            RegSetValueExW(hKey, L"NoLogoff",       0, REG_DWORD, (LPBYTE)&val, sizeof(val));
+            RegCloseKey(hKey);
+        }
+    }
 
     int vx=GetSystemMetrics(SM_XVIRTUALSCREEN);
     int vy=GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -2838,11 +2900,21 @@ static void DoUnlockScreen(void) {
     if(!g_bLocked) return;
     InterlockedExchange((LONG*)&g_bLocked, FALSE);
     SystemParametersInfoW(SPI_SETSCREENSAVERRUNNING, FALSE, NULL, 0);
+    /* v4.10: 解锁后恢复任务管理器和注销功能 */
+    {
+        HKEY hKey;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, L"DisableTaskMgr");
+            RegDeleteValueW(hKey, L"NoLogoff");
+            RegCloseKey(hKey);
+        }
+    }
     if(g_hWndLock) ShowWindow(g_hWndLock,SW_HIDE);
     g_bShowInput=FALSE;
     HWND hDesktop = GetDesktopWindow();
     SetForegroundWindow(hDesktop);
-
 }
 
 /* ============================================================
