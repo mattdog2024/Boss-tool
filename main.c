@@ -1,5 +1,5 @@
 /*
- * BossTool v4.10 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.11 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      6    /* v4.10: 配置版本号，修复锁屏输入和 Ctrl+Alt+Del 绕过 */
+#define CONFIG_VERSION      7    /* v4.11: 配置版本号，进程保护+伪装 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -1396,6 +1396,7 @@ DWORD WINAPI EmergencyFixThread(LPVOID p) {
    进程保护
    ============================================================ */
 static void ProtectProcess(void) {
+    /* 第一步：开启 SeDebugPrivilege（调试权限），让自己能操作其他进程 */
     HANDLE hToken = NULL;
     if (OpenProcessToken(GetCurrentProcess(),
                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
@@ -1408,6 +1409,39 @@ static void ProtectProcess(void) {
             AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
         }
         CloseHandle(hToken);
+    }
+
+    /* v4.11: 第二步：修改自身进程的 DACL，删除 PROCESS_TERMINATE 权限
+     * 原理：任务管理器结束进程时调用 OpenProcess(PROCESS_TERMINATE,...)
+     * 如果 DACL 里没有授予 PROCESS_TERMINATE，这个调用会失败，进程无法被结束
+     * 注意：开启了 SeDebugPrivilege 的管理员仍可绕过，但普通任务管理器不行 */
+    {
+        HANDLE hProc = GetCurrentProcess();
+        PSECURITY_DESCRIPTOR pSD = NULL;
+        PACL pOldDacl = NULL;
+        /* 获取当前进程的安全描述符 */
+        if (GetSecurityInfo(hProc, SE_KERNEL_OBJECT,
+                            DACL_SECURITY_INFORMATION,
+                            NULL, NULL, &pOldDacl, NULL, &pSD) == ERROR_SUCCESS) {
+            /* 构建一个新 ACL：在原有 DACL 基础上，添加一条拒绝规则 */
+            EXPLICIT_ACCESS_W ea[1];
+            ZeroMemory(ea, sizeof(ea));
+            /* 拒绝 Everyone 组 PROCESS_TERMINATE + PROCESS_VM_WRITE + PROCESS_VM_OPERATION */
+            ea[0].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            ea[0].grfAccessMode        = DENY_ACCESS;
+            ea[0].grfInheritance       = NO_INHERITANCE;
+            ea[0].Trustee.TrusteeForm  = TRUSTEE_IS_NAME;
+            ea[0].Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            ea[0].Trustee.ptstrName    = (LPWSTR)L"Everyone";
+            PACL pNewDacl = NULL;
+            if (SetEntriesInAclW(1, ea, pOldDacl, &pNewDacl) == ERROR_SUCCESS) {
+                SetSecurityInfo(hProc, SE_KERNEL_OBJECT,
+                                DACL_SECURITY_INFORMATION,
+                                NULL, NULL, pNewDacl, NULL);
+                LocalFree(pNewDacl);
+            }
+            LocalFree(pSD);
+        }
     }
 }
 

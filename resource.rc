@@ -1,0 +1,38 @@
+/* BossTool resource file - 伪装成 Windows 系统组件 */
+#include <windows.h>
+
+/* ============================================================
+   版本信息 - 伪装成 Windows 音频设备图形隔离进程
+   任务管理器"详细信息"里显示的就是这些字段
+   ============================================================ */
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    10,0,19041,1
+PRODUCTVERSION 10,0,19041,1
+FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+FILEFLAGS      0
+FILEOS         VOS_NT_WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "CompanyName",      "Microsoft Corporation"
+            VALUE "FileDescription",  "Windows \u97f3\u9891\u8bbe\u5907\u56fe\u5f62\u9694\u79bb"
+            VALUE "FileVersion",      "10.0.19041.1 (WinBuild.160101.0800)"
+            VALUE "InternalName",     "audiodg.exe"
+            VALUE "LegalCopyright",   "\u00a9 Microsoft Corporation. All rights reserved."
+            VALUE "OriginalFilename", "audiodg.exe"
+            VALUE "ProductName",      "Microsoft\u00ae Windows\u00ae Operating System"
+            VALUE "ProductVersion",   "10.0.19041.1"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 0x04b0
+    END
+END
+
+/* 应用图标（如果有的话） */
+/* 1 ICON "icon.ico" */
