@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      2    /* v4.5: 配置版本号，升级时自动迁移快捷键 */
+#define CONFIG_VERSION      3    /* v4.7: 配置版本号，纯修饰键组合 Ctrl+Win+Alt */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -196,6 +196,9 @@ static volatile LONG g_dwLastMacRandomizeTick = 0;
 /* v4.3: IPGuard 冷却 — RandomizeMac 后60秒内不触发IP恢复 */
 static volatile LONG g_dwLastNetworkResetTick = 0;
 #define IPGUARD_COOLDOWN_MS (60 * 1000)  /* 60秒冷却 */
+
+/* v4.7: 纯修饰键组合（Ctrl+Win+Alt）触发状态 — 防止按键重复多次触发 */
+static volatile BOOL s_bBossComboTriggered = FALSE;
 
 /* v4.3: WriteLog 线程安全锁 — WatchdogThread/GuardThread/IPGuardThread/BossKeyThread
  * 都并发调用 WriteLog，无锁时多个线程同时 CreateFile/WriteFile 会导致
@@ -1464,8 +1467,8 @@ static void LoadConfig(void) {
             dwSize = sizeof(g_szHideList);
             RegQueryValueExW(hKey, L"HL", NULL, &dwType,
                              (LPBYTE)g_szHideList, &dwSize);
-            /* v4.5: 配置版本迁移 — 旧版注册表无 CV 或版本不匹配时，
-             * 重置老板键为新默认值 Ctrl+Win+Alt+X */
+            /* v4.7: 配置版本迁移 — 旧版注册表无 CV 或版本不匹配时，
+             * 重置老板键为新默认值 Ctrl+Win+Alt（纯修饰键，由钩子处理） */
             DWORD dwVer = 0;
             dwSize = sizeof(dwVer);
             if (RegQueryValueExW(hKey, L"CV", NULL, &dwType,
@@ -1475,7 +1478,7 @@ static void LoadConfig(void) {
                 g_BossVk  = DEFAULT_BOSS_VK;
                 RegCloseKey(hKey);
                 SaveConfig();   /* 写入新默认值 + 版本号 */
-                WriteLog(L"Config migrated to v%d: boss hotkey -> Ctrl+Win+Alt+X",
+                WriteLog(L"Config migrated to v%d: boss hotkey -> Ctrl+Win+Alt (hook)",
                          CONFIG_VERSION);
                 /* 加载保险箱配置 */
                 LoadVaultConfig();
@@ -2301,8 +2304,15 @@ static void RegisterHotkeys(HWND hWnd) {
     UnregisterHotKey(hWnd, HOTKEY_NETFIX);
     UnregisterHotKey(hWnd, HOTKEY_NETFIX_ALT);
     UnregisterHotKey(hWnd, HOTKEY_LOCK);
-    if (!RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk))
-        WriteLog(L"RegisterHotKey BOSS failed err=%lu", GetLastError());
+    /* v4.7: 默认修饰键组合 Ctrl+Win+Alt 由键盘钩子处理，
+     * RegisterHotKey 无法注册纯修饰键组合（无字母键）。
+     * 仅当用户自定义了非默认修饰键时才使用 RegisterHotKey。 */
+    if (g_BossMod != DEFAULT_BOSS_MOD) {
+        if (!RegisterHotKey(hWnd, HOTKEY_BOSS, g_BossMod, g_BossVk))
+            WriteLog(L"RegisterHotKey BOSS failed err=%lu", GetLastError());
+    } else {
+        WriteLog(L"Boss hotkey using keyboard hook (pure modifier combo Ctrl+Win+Alt)");
+    }
     if (!RegisterHotKey(hWnd, HOTKEY_SETTINGS, SETTINGS_MOD, SETTINGS_VK))
         WriteLog(L"RegisterHotKey SETTINGS failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_NETFIX, EMERGENCY_MOD, EMERGENCY_VK))
@@ -2400,6 +2410,24 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         if (g_bBossMode) DoBossKey();
         PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
         return 1;
+    }
+
+    /* v4.7: 纯修饰键组合检测 — 当老板键修饰键为默认 Ctrl+Win+Alt 时，
+     * 通过键盘钩子检测纯修饰键组合，无需额外字母键。
+     * RegisterHotKey 无法注册纯修饰键组合，必须用钩子实现。 */
+    if (g_BossMod == DEFAULT_BOSS_MOD) {
+        BOOL bCtrlNow = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        BOOL bAltNow  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
+        BOOL bWinNow  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
+                        (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
+        if (bDown && bCtrlNow && bWinNow && bAltNow && !s_bBossComboTriggered) {
+            s_bBossComboTriggered = TRUE;
+            DoBossKey();
+            return 1;
+        }
+        if (!bDown && !bCtrlNow && !bWinNow && !bAltNow) {
+            s_bBossComboTriggered = FALSE;
+        }
     }
 
     if (g_bLocked) {
