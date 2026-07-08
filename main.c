@@ -1438,6 +1438,7 @@ DWORD WINAPI GuardThread(LPVOID p) {
 /* ============================================================
    配置读写
    ============================================================ */
+static void SaveConfig(void);   /* 前向声明：LoadConfig 迁移时需要调用 */
 static void LoadConfig(void) {
     HKEY hKey;
     DWORD dwType, dwSize;
