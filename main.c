@@ -103,6 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
+#define CONFIG_VERSION      2    /* v4.5: 配置版本号，升级时自动迁移快捷键 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -1462,9 +1463,45 @@ static void LoadConfig(void) {
             dwSize = sizeof(g_szHideList);
             RegQueryValueExW(hKey, L"HL", NULL, &dwType,
                              (LPBYTE)g_szHideList, &dwSize);
+            /* v4.5: 配置版本迁移 — 旧版注册表无 CV 或版本不匹配时，
+             * 重置老板键为新默认值 Ctrl+Win+Alt+X */
+            DWORD dwVer = 0;
+            dwSize = sizeof(dwVer);
+            if (RegQueryValueExW(hKey, L"CV", NULL, &dwType,
+                                 (LPBYTE)&dwVer, &dwSize) != ERROR_SUCCESS
+                || dwVer < CONFIG_VERSION) {
+                g_BossMod = DEFAULT_BOSS_MOD;
+                g_BossVk  = DEFAULT_BOSS_VK;
+                RegCloseKey(hKey);
+                SaveConfig();   /* 写入新默认值 + 版本号 */
+                WriteLog(L"Config migrated to v%d: boss hotkey -> Ctrl+Win+Alt+X",
+                         CONFIG_VERSION);
+                /* 加载保险箱配置 */
+                LoadVaultConfig();
+                return;
+            }
             RegCloseKey(hKey);
             break;
         }
+    }
+    /* 保存当前配置版本号（首次安装或已是最新版） */
+    {
+        DWORD dwVer = 0; dwSize = sizeof(dwVer);
+        BOOL bNeedSave = FALSE;
+        for (int r = 0; r < 2; r++) {
+            if (RegOpenKeyExW(roots[r], CONFIG_REG_KEY,
+                              0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                dwSize = sizeof(dwVer);
+                if (RegQueryValueExW(hKey, L"CV", NULL, &dwType,
+                                     (LPBYTE)&dwVer, &dwSize) != ERROR_SUCCESS
+                    || dwVer < CONFIG_VERSION) {
+                    bNeedSave = TRUE;
+                }
+                RegCloseKey(hKey);
+                break;
+            }
+        }
+        if (bNeedSave) SaveConfig();
     }
     /* 加载保险箱配置 */
     LoadVaultConfig();
@@ -1493,6 +1530,12 @@ static void SaveConfig(void) {
             RegSetValueExW(hKey, L"HL", 0, REG_SZ,
                 (LPBYTE)g_szHideList,
                 (DWORD)((wcslen(g_szHideList)+1)*sizeof(WCHAR)));
+            /* v4.5: 写入配置版本号，用于升级时自动迁移 */
+            {
+                DWORD dwVer = CONFIG_VERSION;
+                RegSetValueExW(hKey, L"CV", 0, REG_DWORD,
+                    (LPBYTE)&dwVer, sizeof(DWORD));
+            }
             RegCloseKey(hKey);
             break;
         }
