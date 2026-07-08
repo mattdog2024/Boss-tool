@@ -1,5 +1,5 @@
 /*
- * BossTool v4.4 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.8 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      3    /* v4.7: 配置版本号，纯修饰键组合 Ctrl+Win+Alt */
+#define CONFIG_VERSION      4    /* v4.8: 配置版本号，修复 Ctrl+Win+Alt 重置逻辑 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -2412,21 +2412,38 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         return 1;
     }
 
-    /* v4.7: 纯修饰键组合检测 — 当老板键修饰键为默认 Ctrl+Win+Alt 时，
-     * 通过键盘钩子检测纯修饰键组合，无需额外字母键。
-     * RegisterHotKey 无法注册纯修饰键组合，必须用钩子实现。 */
+    /* v4.8: Ctrl+Win+Alt 三键同时按下即触发老板键，无需额外字母键。
+     * RegisterHotKey 无法注册纯修饰键组合，必须用低级键盘钩子实现。
+     *
+     * 修复 v4.7 的两个 bug：
+     * [Bug1] 重置条件太严格：原来要三个键全部同时松开才重置，实际上几乎不可能同时发生，
+     *         导致 s_bBossComboTriggered 永远为 TRUE，第二次按无效。
+     *         修复：任意一个修饰键松开就重置标志。
+     * [Bug2] Win键松开时若无其他键被按，Windows 会弹出开始菜单。
+     *         修复：在 Ctrl 或 Alt 也按着时，吃掉 Win 键的事件防止开始菜单弹出。 */
     if (g_BossMod == DEFAULT_BOSS_MOD) {
         BOOL bCtrlNow = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         BOOL bAltNow  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
         BOOL bWinNow  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
                         (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
+
+        /* 三键同时按下 → 触发老板键 */
         if (bDown && bCtrlNow && bWinNow && bAltNow && !s_bBossComboTriggered) {
             s_bBossComboTriggered = TRUE;
             DoBossKey();
-            return 1;
+            return 1;  /* 吃掉按键，不传递给系统 */
         }
-        if (!bDown && !bCtrlNow && !bWinNow && !bAltNow) {
+
+        /* v4.8 [Bug1] 修复：任意修饰键松开就重置，不要等三键全部同时松开 */
+        if (!bDown && (vk == VK_LCONTROL || vk == VK_RCONTROL ||
+                       vk == VK_LMENU    || vk == VK_RMENU    ||
+                       vk == VK_LWIN     || vk == VK_RWIN)) {
             s_bBossComboTriggered = FALSE;
+        }
+
+        /* v4.8 [Bug2] 修复：在 Ctrl 或 Alt 按着时，吃掉 Win 键事件，防止开始菜单弹出 */
+        if ((vk == VK_LWIN || vk == VK_RWIN) && (bCtrlNow || bAltNow)) {
+            return 1;
         }
     }
 
