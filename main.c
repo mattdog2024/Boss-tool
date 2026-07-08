@@ -101,7 +101,7 @@
 
 #define DEFAULT_LOGIN_PWD   L"ccisme520"
 #define DEFAULT_LOCK_PWD    L"6142234"
-#define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_ALT)
+#define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
@@ -2349,13 +2349,11 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
      * 之前只触发锁屏，用户还需手动按老板键。
      * 现在一步到位：Win+L = 进入老板模式 + 锁屏。 */
     if (!g_bLocked && bDown && bWin && vk == 'L') {
-        /* v4.4: Win+L = 老板键切换 + Ubuntu 锁屏。
-         * DoBossKey 是 toggle：
-         *   不在老板模式 → 进入（切老板IP、隐藏窗口、挂载VHDX、开记事本）
-         *   已在老板模式 → 退出（恢复工作IP、卸载VHDX、显示窗口）
-         * 用户场景：老板来了 → 按 Win+L 退出老板模式+锁屏 →
-         * 老板走了 → 解锁 → 手动按老板键恢复。 */
-        DoBossKey();
+        /* v4.4: Win+L = 仅退出老板模式 + Ubuntu 锁屏（不进入老板模式）。
+         * 用户场景：老板来了 → 已在老板模式 → 按 Win+L 退出老板模式+锁屏 →
+         * 老板走了 → 解锁 → 手动按 Ctrl+Win+Alt 恢复。
+         * 若不在老板模式，Win+L 仅锁屏，不触发老板键。 */
+        if (g_bBossMode) DoBossKey();
         PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
         return 1;
     }
@@ -2846,13 +2844,14 @@ static void ShowLoginDialog(void) {
    v3.3: 设置窗口（含隐私保险箱区域）
    ============================================================ */
 static const WCHAR *g_szModNames[] = {
-    L"Ctrl+Alt", L"Ctrl+Shift", L"Alt+Shift", L"Ctrl+Alt+Shift"
+    L"Ctrl+Alt", L"Ctrl+Shift", L"Alt+Shift", L"Ctrl+Alt+Shift", L"Ctrl+Win+Alt"
 };
 static const UINT g_nModVals[] = {
     MOD_CONTROL|MOD_ALT,
     MOD_CONTROL|MOD_SHIFT,
     MOD_ALT|MOD_SHIFT,
-    MOD_CONTROL|MOD_ALT|MOD_SHIFT
+    MOD_CONTROL|MOD_ALT|MOD_SHIFT,
+    MOD_CONTROL|MOD_WIN|MOD_ALT
 };
 
 LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2891,10 +2890,10 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             WS_CHILD|WS_VISIBLE|WS_BORDER|CBS_DROPDOWNLIST,
             135,y,160,100,hWnd,(HMENU)IDC_SET_BMOD,g_hInst,NULL);
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
-        for(int i=0;i<4;i++)
+        for(int i=0;i<5;i++)
             SendMessageW(h,CB_ADDSTRING,0,(LPARAM)g_szModNames[i]);
         int selM=0;
-        for(int i=0;i<4;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;}
+        for(int i=0;i<5;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;}
         SendMessage(h,CB_SETCURSEL,selM,0);
         y+=28;
 
@@ -3051,7 +3050,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             GetDlgItemTextW(hWnd,IDC_SET_SPWD,g_szLockPwd,63);
             GetDlgItemTextW(hWnd,IDC_SET_HL,g_szHideList,2047);
             int sel=(int)SendDlgItemMessageW(hWnd,IDC_SET_BMOD,CB_GETCURSEL,0,0);
-            if(sel>=0&&sel<4) g_BossMod=g_nModVals[sel];
+            if(sel>=0&&sel<5) g_BossMod=g_nModVals[sel];
             WCHAR szVk[4]={0};
             GetDlgItemTextW(hWnd,IDC_SET_BVK,szVk,3);
             if((szVk[0]>='A'&&szVk[0]<='Z')||(szVk[0]>='0'&&szVk[0]<='9'))
@@ -3117,7 +3116,7 @@ static void ShowSettingsWindow(void) {
         WCHAR szVk[4]={(WCHAR)g_BossVk,0};
         SetDlgItemTextW(g_hWndSettings,IDC_SET_BVK,szVk);
         int selM=0;
-        for(int i=0;i<4;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;}
+        for(int i=0;i<5;i++) if(g_nModVals[i]==g_BossMod){selM=i;break;}
         SendDlgItemMessageW(g_hWndSettings,IDC_SET_BMOD,CB_SETCURSEL,selM,0);
         SendDlgItemMessage(g_hWndSettings,IDC_SET_AR,BM_SETCHECK,
                            g_bAutoRun?BST_CHECKED:BST_UNCHECKED,0);
