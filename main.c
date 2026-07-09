@@ -1,5 +1,5 @@
 /*
- * BossTool v4.14 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.15 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      10   /* v4.14: 强化 DisableLockWorkstation 清除，防止 Win+L 闪烁 */
+#define CONFIG_VERSION      11   /* v4.14: 强化 DisableLockWorkstation 清除，防止 Win+L 闪烁 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -173,14 +173,14 @@
 static HINSTANCE g_hInst        = NULL;
 static HWND      g_hWndMain     = NULL;
 static HWND      g_hWndSettings = NULL;
-static HWND      g_hWndLock     = NULL;
+/* v4.15: g_hWndLock 已删除 */
 static HWND      g_hWndLogin    = NULL;
 static HHOOK     g_hKeyHook     = NULL;
 static HANDLE    g_hMutex       = NULL;
 
 /* 状态标志 */
 static volatile BOOL g_bBossMode = FALSE;
-static volatile BOOL g_bLocked   = FALSE;
+/* v4.15: g_bLocked 已删除 */
 static volatile LONG g_lNetworkChangeBusy = 0;
 static volatile LONG g_lEmergencyFixBusy  = 0;
 static volatile BOOL g_bEnableMacRandomization = TRUE;  /* 每次切换IP时自动随机更换MAC地址 */
@@ -227,18 +227,7 @@ static WCHAR g_szVaultDrive[4]          = L"";   /* 当前挂载的盘符，如 
 static WCHAR g_szVaultSymlink[MAX_PATH] = L"";   /* 临时符号链接路径（.vhdx 扩展名） */
 static volatile BOOL g_bVaultMounted    = FALSE; /* 是否已挂载 */
 
-/* 锁屏状态 */
-static int   g_nLockFail        = 0;
-static DWORD g_dwLockLockTime   = 0;
-static WCHAR g_szLockInput[64]  = {0};
-static int   g_nLockInputLen    = 0;
-static BOOL  g_bShowInput       = FALSE;
-static WCHAR g_szLockMsg[128]   = {0};
-
-/* 锁屏动画 */
-static int   g_nAnimFrame       = 0;
-static WCHAR g_szLogBuf[32][160];
-static int   g_nLogCount        = 0;
+/* v4.15: 锁屏状态变量已删除 */
 
 /* 适配器名称缓存 */
 static WCHAR g_szAdapter[256]   = {0};
@@ -259,7 +248,7 @@ static int   g_nHiddenWnds = 0;
 LRESULT CALLBACK MainWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK LoginWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
-LRESULT CALLBACK LockWndProc(HWND, UINT, WPARAM, LPARAM);
+/* v4.15: LockWndProc 已删除 */
 LRESULT CALLBACK KeyboardHookProc(int, WPARAM, LPARAM);
 /* v4.13: WatchdogThread/GuardThread 已删除 */
 DWORD WINAPI     IPGuardThread(LPVOID);
@@ -267,8 +256,6 @@ DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
 
-static void DoLockScreen(void);
-static void DoUnlockScreen(void);
 static void DoBossKey(void);
 static void ApplyIP(const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*);
 static void LockIPReg(void);
@@ -2448,442 +2435,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     }
 
-    if (g_bLocked) {
-        if (g_hWndLock && IsWindow(g_hWndLock)) {
-            if (bDown) {
-                if (vk == VK_RETURN) {
-                    PostMessage(g_hWndLock, WM_KEYDOWN, VK_RETURN, 0);
-                } else if (vk == VK_ESCAPE) {
-                    PostMessage(g_hWndLock, WM_KEYDOWN, VK_ESCAPE, 0);
-                } else if (vk == VK_BACK) {
-                    PostMessage(g_hWndLock, WM_KEYDOWN, VK_BACK, 0);
-                } else {
-                    /* v4.10: 锁屏状态下用 GetAsyncKeyState 实时查询修饰键状态，
-                     * 而不用 s_bModCtrl/Alt/Win 状态变量。
-                     * 原因：用户按 Ctrl+Win+Alt 触发锁屏后，三键还没完全松开时
-                     * s_bModCtrl/Win/Alt 仍为 TRUE，导致密码字符被过滤。
-                     * 在锁屏状态下 GetAsyncKeyState 的时序问题不影响密码输入，
-                     * 因为密码键不是修饰键，不依赖 WM_SYSKEYDOWN。 */
-                    BOOL bCtrlNow = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                    BOOL bAltNow  = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
-                    BOOL bWinNow  = (GetAsyncKeyState(VK_LWIN)    & 0x8000) != 0 ||
-                                   (GetAsyncKeyState(VK_RWIN)    & 0x8000) != 0;
-                    if (!bCtrlNow && !bAltNow && !bWinNow) {
-                        /* 构造一个干净的键盘状态（只保留 Shift/CapsLock），
-                         * 避免 Alt 键尚未完全释放时 ToUnicode 输出异常字符 */
-                        BYTE keyState[256] = {0};
-                        if (GetAsyncKeyState(VK_SHIFT) & 0x8000) keyState[VK_SHIFT] = 0x80;
-                        if (GetKeyState(VK_CAPITAL) & 1)         keyState[VK_CAPITAL] = 0x01;
-                        WCHAR wchars[4] = {0};
-                        int nChars = ToUnicode(vk, kb->scanCode, keyState, wchars, 3, 0);
-                        if (nChars == 1 && wchars[0] >= 32 && wchars[0] != 127)
-                            PostMessage(g_hWndLock, WM_CHAR, (WPARAM)wchars[0], 0);
-                    }
-                }
-            }
-        }
-        return 1;
-    }
+    /* v4.15: 锁屏功能已彻底删除，此处不再拦截任何键盘事件 */
 
     return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
 }
 
-/* ============================================================
-   锁屏界面
-   ============================================================ */
-static void GenLogLine(void) {
-    static const WCHAR *tpls[] = {
-        L"[INFO]  stream-relay: client 192.168.%d.%d connected, bitrate %d kbps",
-        L"[INFO]  ffmpeg: encoding H.264 frame %d, pts=%d, qp=%d",
-        L"[DEBUG] nginx: upstream %d.%d.%d.%d response 200 OK in %dms",
-        L"[INFO]  rtmp: publish /live/stream%d started, fps=%d",
-        L"[WARN]  buffer: queue depth %d/%d, dropping %d frames",
-        L"[INFO]  cpu: core%d usage %.1f%%, temp %d°C",
-        L"[INFO]  net: eth0 rx %d.%dMB/s tx %d.%dMB/s pkts=%d",
-        L"[INFO]  disk: /dev/sda1 read %dMB/s write %dMB/s util=%d%%",
-        L"[DEBUG] hls: segment #%d written, duration %.3fs, size=%dKB",
-        L"[INFO]  clients: %d active, %d buffering, %d idle",
-        L"[INFO]  mem: used %dMB free %dMB cached %dMB",
-        L"[DEBUG] tcp: established %d time_wait %d close_wait %d",
-        L"[INFO]  watchdog: all services OK, uptime %dh%dm%ds",
-        L"[INFO]  transcode: 1080p->720p@%dkbps 1080p->480p@%dkbps",
-        L"[DEBUG] ssl: cert expires in %d days, handshakes %d/s",
-    };
-    int n = (int)(sizeof(tpls)/sizeof(tpls[0]));
-    int idx = rand() % n;
-    int a=rand()%254+1, b=rand()%254+1, c=rand()%9999+1;
-    int d=rand()%100, e=rand()%100, f=rand()%100;
-    _snwprintf(g_szLogBuf[g_nLogCount % 32], 159,
-               tpls[idx], a, b, c, d, e, f);
-    g_nLogCount++;
-}
+/* v4.15: 锁屏界面代码已彻底删除 */
 
-static void GetUptimeStr(WCHAR *buf, int sz) {
-    DWORD ms = GetTickCount();
-    DWORD s=ms/1000, m=s/60, h=m/60, d=h/24;
-    _snwprintf(buf, sz-1, L"%dd %02dh:%02dm:%02ds", d, h%24, m%60, s%60);
-}
-
-static void DrawLockScreen(HWND hWnd, HDC hdc) {
-    RECT rc;
-    GetClientRect(hWnd, &rc);
-    int W = rc.right, H = rc.bottom;
-
-    HBRUSH hBk = CreateSolidBrush(RGB(0,0,0));
-    FillRect(hdc, &rc, hBk);
-    DeleteObject(hBk);
-    SetBkMode(hdc, TRANSPARENT);
-
-    HFONT hFT = CreateFontW(15,0,0,0,FW_NORMAL,0,0,0,
-        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,FIXED_PITCH|FF_MODERN,L"Courier New");
-    HFONT hFTB = CreateFontW(15,0,0,0,FW_BOLD,0,0,0,
-        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,FIXED_PITCH|FF_MODERN,L"Courier New");
-    HFONT hFTL = CreateFontW(44,0,0,0,FW_BOLD,0,0,0,
-        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,FIXED_PITCH|FF_MODERN,L"Courier New");
-    HFONT hOld = (HFONT)SelectObject(hdc, hFT);
-
-    HBRUSH hGreen = CreateSolidBrush(RGB(0,80,0));
-    RECT rcBar = {0,0,W,26};
-    FillRect(hdc, &rcBar, hGreen);
-    DeleteObject(hGreen);
-    SelectObject(hdc, hFTB);
-    SetTextColor(hdc, RGB(200,255,200));
-    WCHAR szTitle[] = L" Ubuntu 22.04.3 LTS  |  mediaserver-01  |  kernel 5.15.0-91-generic x86_64";
-    TextOutW(hdc, 4, 5, szTitle, (int)wcslen(szTitle));
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-    WCHAR szTime[32];
-    _snwprintf(szTime, 31, L"%02d:%02d:%02d", st.wHour, st.wMinute, st.wSecond);
-    SelectObject(hdc, hFTL);
-    SetTextColor(hdc, RGB(0,230,100));
-    SIZE tsz; GetTextExtentPoint32W(hdc, szTime, (int)wcslen(szTime), &tsz);
-    TextOutW(hdc, (W-tsz.cx)/2, 34, szTime, (int)wcslen(szTime));
-
-    WCHAR szDate[48];
-    const WCHAR *days[] = {L"Sunday",L"Monday",L"Tuesday",L"Wednesday",
-                            L"Thursday",L"Friday",L"Saturday"};
-    _snwprintf(szDate, 47, L"%04d-%02d-%02d  %ls",
-               st.wYear, st.wMonth, st.wDay, days[st.wDayOfWeek]);
-    SelectObject(hdc, hFT);
-    SetTextColor(hdc, RGB(0,180,80));
-    SIZE dsz; GetTextExtentPoint32W(hdc, szDate, (int)wcslen(szDate), &dsz);
-    TextOutW(hdc, (W-dsz.cx)/2, 84, szDate, (int)wcslen(szDate));
-
-    int y = 108;
-    int cols = (W-10)/9; if(cols>120)cols=120; if(cols<40)cols=40;
-    WCHAR szSep[128];
-    for(int i=0;i<cols&&i<127;i++) szSep[i]=L'='; szSep[cols]=0;
-    SetTextColor(hdc, RGB(0,100,0));
-    TextOutW(hdc, 5, y, szSep, cols); y+=18;
-
-    SetTextColor(hdc, RGB(0,220,80));
-    static int nMem=4200, nNet=0, nDisk=0;
-    static float fCPU=12.5f;
-    if(g_nAnimFrame%3==0) {
-        nMem  = 3800+rand()%1200;
-        nNet  = rand()%900+100;
-        nDisk = rand()%400+50;
-        fCPU  = (float)(rand()%600+50)/10.0f;
-    }
-    WCHAR szUptime[64]; GetUptimeStr(szUptime, 63);
-    WCHAR szLine[160];
-
-    _snwprintf(szLine,159,L"  hostname: mediaserver-01          uptime: %ls", szUptime);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,L"  os: Ubuntu 22.04.3 LTS (GNU/Linux 5.15.0-91-generic x86_64)");
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,
-        L"  cpu: Intel(R) Xeon(R) Silver 4214R @ 2.40GHz  cores:24  load:%.1f %.1f %.1f",
-        fCPU, fCPU*0.8f, fCPU*0.6f);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,
-        L"  memory: %dMB used / 32768MB total (%.1f%%)  swap: %d/8192MB",
-        nMem, (float)nMem/327.68f, nMem/16);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,
-        L"  network: eth0  rx:%d.%dMB/s  tx:%d.%dMB/s  ip:20.65.32.199/24",
-        nNet/100, nNet%100, (nNet/4)/100, (nNet/4)%100);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,
-        L"  storage: /dev/sda1  read:%dMB/s  write:%dMB/s  used:1.2TB/4.0TB",
-        nDisk, nDisk/3);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-
-    SetTextColor(hdc, RGB(0,100,0));
-    TextOutW(hdc,5,y,szSep,cols); y+=18;
-    SetTextColor(hdc, RGB(0,220,80));
-
-    int streams=3+rand()%4, clients=15+rand()%30;
-    int bitrate=8000+rand()%6000, dropped=rand()%3;
-    _snwprintf(szLine,159,L"  services:  nginx[OK]  ffmpeg[OK]  rtmp[OK]  hls[OK]  redis[OK]");
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-    _snwprintf(szLine,159,
-        L"  streams: %d active  clients: %d connected  bitrate: %dkbps  dropped: %d/s",
-        streams, clients, bitrate, dropped);
-    TextOutW(hdc,5,y,szLine,(int)wcslen(szLine)); y+=17;
-
-    SetTextColor(hdc, RGB(0,100,0));
-    TextOutW(hdc,5,y,szSep,cols); y+=18;
-
-    SelectObject(hdc, hFTB);
-    SetTextColor(hdc, RGB(0,160,50));
-    WCHAR szLogHdr[] = L"  [ System Log - Real-time ]";
-    TextOutW(hdc,5,y,szLogHdr,(int)wcslen(szLogHdr)); y+=18;
-    SelectObject(hdc, hFT);
-
-    int logLines = (H - y - 55) / 16;
-    if(logLines<1) logLines=1;
-    if(logLines>20) logLines=20;
-    int logStart = g_nLogCount>logLines ? g_nLogCount-logLines : 0;
-    for(int i=logStart; i<g_nLogCount && i<logStart+logLines; i++) {
-        int idx = i%32;
-        if(g_szLogBuf[idx][0]) {
-            if(wcsncmp(g_szLogBuf[idx],L"[WARN]",6)==0)
-                SetTextColor(hdc,RGB(255,200,0));
-            else if(wcsncmp(g_szLogBuf[idx],L"[ERROR]",7)==0)
-                SetTextColor(hdc,RGB(255,80,80));
-            else if(wcsncmp(g_szLogBuf[idx],L"[DEBUG]",7)==0)
-                SetTextColor(hdc,RGB(0,140,100));
-            else
-                SetTextColor(hdc,RGB(0,200,70));
-            TextOutW(hdc,5,y,g_szLogBuf[idx],(int)wcslen(g_szLogBuf[idx]));
-            y+=16;
-        }
-    }
-
-    if(g_bShowInput) {
-        int bx=(W-380)/2, by=(H-130)/2;
-        if(bx<10) bx=10; if(by<10) by=10;
-        HBRUSH hBr = CreateSolidBrush(RGB(0,15,0));
-        RECT rcBox = {bx,by,bx+380,by+130};
-        FillRect(hdc,&rcBox,hBr);
-        DeleteObject(hBr);
-        HPEN hPen = CreatePen(PS_SOLID,2,RGB(0,200,80));
-        HPEN hOP = (HPEN)SelectObject(hdc,hPen);
-        MoveToEx(hdc,bx,by,NULL); LineTo(hdc,bx+380,by);
-        LineTo(hdc,bx+380,by+130); LineTo(hdc,bx,by+130); LineTo(hdc,bx,by);
-        SelectObject(hdc,hOP); DeleteObject(hPen);
-        SelectObject(hdc,hFTB);
-        SetTextColor(hdc,RGB(0,255,100));
-        TextOutW(hdc,bx+10,by+12,L"Enter unlock password:",22);
-        WCHAR stars[65]={0};
-        for(int i=0;i<g_nLockInputLen&&i<64;i++) stars[i]=L'*';
-        SelectObject(hdc,hFT);
-        SetTextColor(hdc,RGB(200,255,200));
-        TextOutW(hdc,bx+10,by+36,stars,g_nLockInputLen);
-        if(g_nAnimFrame%2==0)
-            TextOutW(hdc,bx+10+g_nLockInputLen*9,by+36,L"_",1);
-        if(g_szLockMsg[0]) {
-            SetTextColor(hdc,RGB(255,100,100));
-            TextOutW(hdc,bx+10,by+62,g_szLockMsg,(int)wcslen(g_szLockMsg));
-        }
-        SetTextColor(hdc,RGB(60,120,60));
-        TextOutW(hdc,bx+10,by+90,L"[Enter]=confirm  [Esc]=cancel  [Backspace]=delete",49);
-        TextOutW(hdc,bx+10,by+108,L"5 failures = 60s lockout",24);
-    }
-
-    HFONT hFS = CreateFontW(12,0,0,0,FW_NORMAL,0,0,0,
-        DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY,FIXED_PITCH|FF_MODERN,L"Courier New");
-    SelectObject(hdc,hFS);
-    SetTextColor(hdc,RGB(40,80,40));
-    WCHAR szHint[] = L"  Press any key to unlock...";
-    TextOutW(hdc,5,H-22,szHint,(int)wcslen(szHint));
-    DeleteObject(hFS);
-
-    SelectObject(hdc,hOld);
-    DeleteObject(hFT); DeleteObject(hFTB); DeleteObject(hFTL);
-}
-
-LRESULT CALLBACK LockWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    (void)lParam;
-    switch(msg) {
-    case WM_CREATE:
-        SetTimer(hWnd,1,700,NULL);
-        memset(g_szLogBuf,0,sizeof(g_szLogBuf));
-        g_nLogCount=0;
-        srand((unsigned)time(NULL));
-        for(int i=0;i<20;i++) GenLogLine();
-        break;
-    case WM_TIMER:
-        if(wParam==1) {
-            g_nAnimFrame++;
-            GenLogLine();
-            InvalidateRect(hWnd,NULL,FALSE);
-        }
-        break;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd,&ps);
-        RECT rc; GetClientRect(hWnd,&rc);
-        HDC hMem = CreateCompatibleDC(hdc);
-        HBITMAP hBmp = CreateCompatibleBitmap(hdc,rc.right,rc.bottom);
-        HBITMAP hOld = (HBITMAP)SelectObject(hMem,hBmp);
-        DrawLockScreen(hWnd,hMem);
-        BitBlt(hdc,0,0,rc.right,rc.bottom,hMem,0,0,SRCCOPY);
-        SelectObject(hMem,hOld);
-        DeleteObject(hBmp);
-        DeleteDC(hMem);
-        EndPaint(hWnd,&ps);
-        break;
-    }
-    case WM_KEYDOWN:
-        if(wParam==VK_RETURN) {
-            if(!g_bShowInput) {
-                g_bShowInput=TRUE;
-                g_nLockInputLen=0;
-                g_szLockInput[0]=0;
-                g_szLockMsg[0]=0;
-                InvalidateRect(hWnd,NULL,FALSE);
-            } else {
-                g_szLockInput[g_nLockInputLen]=0;
-                if(g_dwLockLockTime && (GetTickCount()-g_dwLockLockTime)<60000) {
-                    wcscpy(g_szLockMsg,L"Too many failures. Wait 60s.");
-                    InvalidateRect(hWnd,NULL,FALSE);
-                    break;
-                }
-                if(wcscmp(g_szLockInput,g_szLockPwd)==0) {
-                    DoUnlockScreen();
-                } else {
-                    g_nLockFail++;
-                    if(g_nLockFail>=5) {
-                        g_dwLockLockTime=GetTickCount();
-                        g_nLockFail=0;
-                        wcscpy(g_szLockMsg,L"Locked 60s!");
-                    } else {
-                        _snwprintf(g_szLockMsg,127,L"Wrong password! (%d/5)",g_nLockFail);
-                    }
-                    g_nLockInputLen=0;
-                    g_szLockInput[0]=0;
-                    InvalidateRect(hWnd,NULL,FALSE);
-                }
-            }
-        } else if(wParam==VK_ESCAPE) {
-            if(g_bShowInput) {
-                g_bShowInput=FALSE;
-                g_nLockInputLen=0;
-                g_szLockInput[0]=0;
-                g_szLockMsg[0]=0;
-                InvalidateRect(hWnd,NULL,FALSE);
-            }
-        } else if(wParam==VK_BACK) {
-            if(g_bShowInput && g_nLockInputLen>0) {
-                g_szLockInput[--g_nLockInputLen]=0;
-                InvalidateRect(hWnd,NULL,FALSE);
-            }
-        }
-        break;
-    case WM_CHAR:
-        if(g_bShowInput && wParam>=32 && wParam!=127 && g_nLockInputLen<63) {
-            g_szLockInput[g_nLockInputLen++]=(WCHAR)wParam;
-            g_szLockInput[g_nLockInputLen]=0;
-            InvalidateRect(hWnd,NULL,FALSE);
-        }
-        break;
-    case WM_LBUTTONDOWN:
-    case WM_RBUTTONDOWN:
-    case WM_MBUTTONDOWN:
-        if(!g_bShowInput) {
-            g_bShowInput=TRUE;
-            g_nLockInputLen=0;
-            g_szLockInput[0]=0;
-            g_szLockMsg[0]=0;
-            InvalidateRect(hWnd,NULL,FALSE);
-        }
-        break;
-    case WM_CLOSE:
-        return 0;
-    case WM_DESTROY:
-        KillTimer(hWnd,1);
-        break;
-    }
-    return DefWindowProcW(hWnd,msg,wParam,lParam);
-}
-
-/* ============================================================
-   锁屏控制
-   ============================================================ */
-static void DoLockScreen(void) {
-    if(g_bLocked) return;
-    InterlockedExchange((LONG*)&g_bLocked, TRUE);
-    g_bShowInput=FALSE;
-    g_nLockFail=0;
-    g_dwLockLockTime=0;
-    g_szLockInput[0]=0;
-    g_nLockInputLen=0;
-    g_szLockMsg[0]=0;
-
-    SystemParametersInfoW(SPI_SETSCREENSAVERRUNNING, TRUE, NULL, 0);
-    ExecHidden(L"taskkill /f /im LockApp.exe");
-    ExecHidden(L"taskkill /f /im LogonUI.exe");
-    /* v4.10: 锁屏时禁用任务管理器和注销，防止 Ctrl+Alt+Del 绕过 */
-    {
-        HKEY hKey;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER,
-            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            DWORD val = 1;
-            RegSetValueExW(hKey, L"DisableTaskMgr", 0, REG_DWORD, (LPBYTE)&val, sizeof(val));
-            RegSetValueExW(hKey, L"NoLogoff",       0, REG_DWORD, (LPBYTE)&val, sizeof(val));
-            RegCloseKey(hKey);
-        }
-    }
-
-    int vx=GetSystemMetrics(SM_XVIRTUALSCREEN);
-    int vy=GetSystemMetrics(SM_YVIRTUALSCREEN);
-    int vw=GetSystemMetrics(SM_CXVIRTUALSCREEN);
-    int vh=GetSystemMetrics(SM_CYVIRTUALSCREEN);
-
-    if(!g_hWndLock) {
-        WNDCLASSW wc={0};
-        wc.lpfnWndProc   = LockWndProc;
-        wc.hInstance     = g_hInst;
-        wc.lpszClassName = L"BossToolLock";
-        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.hCursor       = LoadCursor(NULL,IDC_ARROW);
-        wc.style         = CS_DBLCLKS|CS_OWNDC;
-        RegisterClassW(&wc);
-        g_hWndLock = CreateWindowExW(
-            WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
-            L"BossToolLock", L"",
-            WS_POPUP,
-            vx,vy,vw,vh,
-            NULL,NULL,g_hInst,NULL);
-    } else {
-        SetWindowPos(g_hWndLock,HWND_TOPMOST,vx,vy,vw,vh,SWP_SHOWWINDOW);
-    }
-    ShowWindow(g_hWndLock,SW_SHOW);
-    UpdateWindow(g_hWndLock);
-    SetForegroundWindow(g_hWndLock);
-    BringWindowToTop(g_hWndLock);
-    SetFocus(g_hWndLock);
-    SetActiveWindow(g_hWndLock);
-}
-
-static void DoUnlockScreen(void) {
-    if(!g_bLocked) return;
-    InterlockedExchange((LONG*)&g_bLocked, FALSE);
-    SystemParametersInfoW(SPI_SETSCREENSAVERRUNNING, FALSE, NULL, 0);
-    /* v4.10: 解锁后恢复任务管理器和注销功能 */
-    {
-        HKEY hKey;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0, KEY_SET_VALUE, &hKey) == ERROR_SUCCESS) {
-            RegDeleteValueW(hKey, L"DisableTaskMgr");
-            RegDeleteValueW(hKey, L"NoLogoff");
-            RegCloseKey(hKey);
-        }
-    }
-    if(g_hWndLock) ShowWindow(g_hWndLock,SW_HIDE);
-    g_bShowInput=FALSE;
-    HWND hDesktop = GetDesktopWindow();
-    SetForegroundWindow(hDesktop);
-}
 
 /* ============================================================
    登录对话框
