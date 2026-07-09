@@ -1,5 +1,5 @@
 /*
- * BossTool v4.16 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.17 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      12   /* v4.16: 修复 Win+L 闪烁根源：仅三键全按时才吃掉 Win 键 */
+#define CONFIG_VERSION      13   /* v4.17: 老板键响应加速 + 网络恢复重试 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -253,6 +253,7 @@ LRESULT CALLBACK KeyboardHookProc(int, WPARAM, LPARAM);
 /* v4.13: WatchdogThread/GuardThread 已删除 */
 DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
+static DWORD WINAPI VaultEjectThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
 
@@ -2327,20 +2328,53 @@ static void RegisterHotkeys(HWND hWnd) {
 DWORD WINAPI BossKeyThread(LPVOID pParam) {
     BOOL bEnterBoss = (BOOL)(ULONG_PTR)pParam;
     if (bEnterBoss) {
-        /* 进入老板模式：切换IP + 隐藏程序 + 清理痕迹 + 挂载保险箱 */
-        SetIPBoss();
-        HideProcessWindows();
+        /* 进入老板模式：隐藏程序立即执行（用户感知快），切换IP和挂载保险筱在后台进行 */
+        HideProcessWindows();   /* v4.17: 先隐藏，用户感知即刻响应 */
         CleanTraces();
-        /* v3.3: 自动挂载保险箱 */
+        SetIPBoss();            /* IP切换在隐藏后执行 */
         VaultAutoMount();
     } else {
-        /* 退出老板模式：弹出保险箱 + 恢复工作IP + 显示程序 + 清理痕迹 */
-        /* v3.3: 先弹出保险箱（在切换IP之前，确保网络正常） */
-        VaultAutoEject();
-        SetIPWork();
-        ShowProcessWindows();
+        /* v4.17: 退出老板模式优化：
+         * 1. 先显示窗口（用户感知即刻响应）
+         * 2. VaultAutoEject 和 SetIPWork 并行执行（各起一个线程）
+         * 3. SetIPWork 完成后验证网络，如果不通则重试 */
+        ShowProcessWindows();   /* v4.17: 先显示，用户感知快 */
         CleanTraces();
+        /* VaultAutoEject 在独立线程里执行，不阻塞 IP 切换 */
+        StartDetachedThread(VaultEjectThread, NULL);
+        /* IP 切换并验证 */
+        SetIPWork();
+        /* v4.17: 验证网络是否恢复，最多重试 3 次 */
+        for (int retry = 0; retry < 3; retry++) {
+            Sleep(1500);
+            if (AdapterHasIP(IP_WORK1)) {
+                WriteLog(L"BossKeyThread: 网络已恢复，尝试 %d 次", retry + 1);
+                break;
+            }
+            WriteLog(L"BossKeyThread: 网络未恢复，重试 %d/3", retry + 1);
+            if (retry < 2) {
+                /* 重新申请锁并应用IP */
+                if (BeginNetworkChange()) {
+                    ClearAccumulatedIPs();
+                    wcsncpy(g_szExpectedIP, IP_WORK1, 63);
+                    WCHAR args[512];
+                    const WCHAR *adpName = GetAdapterName();
+                    _snwprintf(args, 511,
+                        L"interface ipv4 set address name=\"%ls\" source=static addr=%ls mask=%ls gateway=%ls store=active",
+                        adpName, IP_WORK1, IP_WORK_MASK, IP_WORK_GW);
+                    RunNetshDirect(args);
+                    Sleep(200);
+                    EndNetworkChange();
+                }
+            }
+        }
     }
+    return 0;
+}
+/* v4.17: VaultAutoEject 独立线程，不阻塞 IP 切换 */
+static DWORD WINAPI VaultEjectThread(LPVOID p) {
+    (void)p;
+    VaultAutoEject();
     return 0;
 }
 
