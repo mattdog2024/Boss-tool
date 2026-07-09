@@ -1,5 +1,5 @@
 /*
- * BossTool v4.17 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.18 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      13   /* v4.17: 老板键响应加速 + 网络恢复重试 */
+#define CONFIG_VERSION      13   /* v4.18: 设置菜单加退出按鈕 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -140,6 +140,12 @@
 #define WM_LOCK_SCREEN   (WM_USER+10)
 #define WM_SHOW_SETTINGS (WM_USER+13)
 #define WM_BOSS_KEY      (WM_USER+14)  /* v4.4: Win+L 联动老板键 */
+#define WM_TRAY_ICON     (WM_USER+20)  /* v4.18: 托盘图标消息 */
+/* 托盘菜单命令 ID */
+#define IDM_TRAY_SETTINGS  1001
+#define IDM_TRAY_BOSS      1002
+#define IDM_TRAY_NETFIX    1003
+#define IDM_TRAY_EXIT      1004
 
 /* 控件ID */
 #define IDC_LOGIN_PWD    2001
@@ -157,6 +163,7 @@
 #define IDC_SET_SAVE     3009
 #define IDC_SET_CLOSE    3010
 #define IDC_SET_APPLYIP  3011
+#define IDC_SET_EXIT     3013  /* v4.18: 退出程序 */
 #define IDC_SET_ALLOWIP  3012
 
 /* v3.3: 隐私保险箱控件ID */
@@ -2728,6 +2735,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             WS_CHILD|WS_VISIBLE,
             275,y,80,28,hWnd,(HMENU)IDC_SET_CLOSE,g_hInst,NULL);
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
+        /* v4.18: 退出程序按鈕 */
+        y+=34;
+        h=CreateWindowW(L"BUTTON",L"退出程序（当前处于老板模式时会先恢复IP）",
+            WS_CHILD|WS_VISIBLE,
+            8,y,360,28,hWnd,(HMENU)IDC_SET_EXIT,g_hInst,NULL);
+        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
         break;
     }
     case WM_COMMAND: {
@@ -2815,6 +2828,22 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if(id==IDC_SET_APPLYIP) {
             SetIPWork();
             MessageBoxW(hWnd,L"工作IP已应用！",L"提示",MB_OK);
+        } else if(id==IDC_SET_EXIT) {
+            /* v4.18: 退出程序 */
+            int ret = MessageBoxW(hWnd,
+                L"确定要退出 BossTool 吗？\r\n如果当前处于老板模式，退出前会自动恢复工作IP。",
+                L"退出确认", MB_YESNO | MB_ICONQUESTION);
+            if (ret == IDYES) {
+                /* 如果在老板模式，先恢复工作IP */
+                if (g_bBossMode) {
+                    InterlockedExchange((LONG*)&g_bBossMode, FALSE);
+                    SetIPWork();
+                }
+                /* 关闭设置窗口 */
+                ShowWindow(hWnd, SW_HIDE);
+                /* 退出主程序 */
+                DestroyWindow(g_hWndMain);
+            }
         }
         break;
     }
@@ -2842,7 +2871,7 @@ static void ShowSettingsWindow(void) {
             WS_EX_TOPMOST|WS_EX_TOOLWINDOW,
             L"BossToolSettings",L"系统设置",
             WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,
-            (cx-400)/2,(cy-580)/2,400,580,
+            (cx-400)/2,(cy-625)/2,400,625,  /* v4.18: +45px 容纳退出按鈕 */
             NULL,NULL,g_hInst,NULL);
     } else {
         /* 刷新控件内容 */
@@ -2878,7 +2907,6 @@ static void ShowSettingsWindow(void) {
    主窗口
    ============================================================ */
 LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    (void)lParam;
     switch(msg) {
     case WM_HOTKEY:
         if(wParam==HOTKEY_BOSS) {
@@ -2896,7 +2924,68 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
     case WM_SHOW_SETTINGS:
         ShowSettingsWindow();
         break;
+    /* v4.18: 托盘图标消息处理 */
+    case WM_TRAY_ICON:
+        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
+            POINT pt;
+            GetCursorPos(&pt);
+            HMENU hMenu = CreatePopupMenu();
+            if (hMenu) {
+                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SETTINGS,
+                    g_bBossMode ? L"老板模式中... (设置)" : L"设置 (Ctrl+Alt+F10)");
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_BOSS,
+                    g_bBossMode ? L"退出老板模式" : L"进入老板模式 (Ctrl+Win+Alt)");
+                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_NETFIX, L"一键修复网络");
+                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"退出程序");
+                /* 必须先把窗口置前景，否则 TrackPopupMenu 不工作 */
+                SetForegroundWindow(hWnd);
+                TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RIGHTALIGN,
+                    pt.x, pt.y, 0, hWnd, NULL);
+                PostMessageW(hWnd, WM_NULL, 0, 0);
+                DestroyMenu(hMenu);
+            }
+        }
+        break;
+    case WM_COMMAND:
+        switch(LOWORD(wParam)) {
+        case IDM_TRAY_SETTINGS:
+            ShowLoginDialog();
+            break;
+        case IDM_TRAY_BOSS:
+            DoBossKey();
+            break;
+        case IDM_TRAY_NETFIX:
+            StartDetachedThread(EmergencyFixThread, NULL);
+            break;
+        case IDM_TRAY_EXIT:
+            /* 退出前如果在老板模式，先恢复工作IP */
+            if (g_bBossMode) {
+                InterlockedExchange((LONG*)&g_bBossMode, FALSE);
+                SetIPWork();
+            }
+            /* 删除托盘图标 */
+            {
+                NOTIFYICONDATAW nid = {0};
+                nid.cbSize = sizeof(nid);
+                nid.hWnd   = hWnd;
+                nid.uID    = 1;
+                Shell_NotifyIconW(NIM_DELETE, &nid);
+            }
+            DestroyWindow(hWnd);
+            break;
+        }
+        break;
     case WM_DESTROY:
+        /* 确保托盘图标被删除 */
+        {
+            NOTIFYICONDATAW nid = {0};
+            nid.cbSize = sizeof(nid);
+            nid.hWnd   = hWnd;
+            nid.uID    = 1;
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
         PostQuitMessage(0);
         break;
     }
