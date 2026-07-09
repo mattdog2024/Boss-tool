@@ -1,5 +1,5 @@
 /*
- * BossTool v4.15 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.16 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      11   /* v4.14: 强化 DisableLockWorkstation 清除，防止 Win+L 闪烁 */
+#define CONFIG_VERSION      12   /* v4.16: 修复 Win+L 闪烁根源：仅三键全按时才吃掉 Win 键 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -2423,8 +2423,13 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
      * 三键中任意一键按下时，检查另两键是否已按着，满足则触发。
      * 同时吃掉 Win 键事件防止开始菜单弹出。 */
     if (g_BossMod == DEFAULT_BOSS_MOD) {
-        /* 吃掉 Win 键事件（防开始菜单）：当 Ctrl 或 Alt 按着时 */
-        if ((vk == VK_LWIN || vk == VK_RWIN) && (bCtrl || bAlt)) {
+        /* v4.16: 只在 Ctrl+Win+Alt 三键全部同时按着时才吃掉 Win 键（防开始菜单）。
+         * 之前的逻辑是"Ctrl 或 Alt 任意一个按着就吃掉 Win 键"，
+         * 这会导致 Win+L 时如果 s_bModCtrl/s_bModAlt 因上次操作遗留为 TRUE，
+         * Win 键事件被吃掉，系统收不到完整的 Win+L → 屏幕疯狂闪烁。
+         * 新逻辑：必须三键全部同时按着才吃掉 Win 键，Win+L 绝不受影响。 */
+        if ((vk == VK_LWIN || vk == VK_RWIN) && bCtrl && bAlt) {
+            /* 三键全部按着，吃掉 Win 键防止开始菜单 */
             return 1;
         }
         /* 三键同时按下 → 触发老板键 */
