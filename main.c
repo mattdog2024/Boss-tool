@@ -1,5 +1,5 @@
 /*
- * BossTool v4.13 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.14 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      9    /* v4.13: 删除锁屏功能，恢复 Win+L 正常工作 */
+#define CONFIG_VERSION      10   /* v4.14: 强化 DisableLockWorkstation 清除，防止 Win+L 闪烁 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -2360,16 +2360,27 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
 
-    /* v4.13: 去掉禁用 Win+L 的注册表操作，锁屏功能已删除，恢复 Win+L 正常工作。
-     * 同时在程序启动时主动删除旧版本可能遗留的注册表项 */
+    /* v4.14: 强制删除旧版本遗留的 DisableLockWorkstation 注册表项。
+     * 该项会导致 Win+L 按下后屏幕疯狂闪烁。
+     * 使用两种方式确保删除成功：
+     * 1. 直接 RegDeleteValue（程序本身已管理员权限）
+     * 2. 备用 reg delete 命令（静默执行，不弹窗口） */
     {
+        /* 方式1: 直接 API 删除 */
         HKEY hKey;
+        BOOL bDeleted = FALSE;
         if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
             L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
             0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-            RegDeleteValueW(hKey, L"DisableLockWorkstation");
+            if (RegDeleteValueW(hKey, L"DisableLockWorkstation") == ERROR_SUCCESS)
+                bDeleted = TRUE;
             RegCloseKey(hKey);
         }
+        /* 方式2: 备用 reg delete 命令（静默，不弹窗口） */
+        if (!bDeleted) {
+            ExecHidden(L"reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableLockWorkstation /f");
+        }
+        WriteLog(L"v4.14: 已尝试删除 DisableLockWorkstation 注册表项 (bDeleted=%d)", (int)bDeleted);
     }
 
     /* v3.5: 启动时扫描并卸载旧版遗留的VHDX（更换版本后第一次运行） */
