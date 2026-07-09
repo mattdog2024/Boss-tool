@@ -1,5 +1,5 @@
 /*
- * BossTool v4.12 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.13 - Windows 7/8/10/11 隱形管理工具
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +103,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      8    /* v4.12: 修复锁屏闪烁+进程保护锁死自己 */
+#define CONFIG_VERSION      9    /* v4.13: 删除锁屏功能，恢复 Win+L 正常工作 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -261,8 +261,7 @@ LRESULT CALLBACK LoginWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK SettingsWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK LockWndProc(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK KeyboardHookProc(int, WPARAM, LPARAM);
-DWORD WINAPI     WatchdogThread(LPVOID);
-DWORD WINAPI     GuardThread(LPVOID);
+/* v4.13: WatchdogThread/GuardThread 已删除 */
 DWORD WINAPI     IPGuardThread(LPVOID);
 DWORD WINAPI     BossKeyThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
@@ -1446,58 +1445,9 @@ static void ProtectProcess(void) {
 /* ============================================================
    看门狗线程
    ============================================================ */
-/* v4.10: 关闭绕过锁屏的窗口并重新激活锁屏 */
-static void KillBypassWindows(void) {
-    /* 任务管理器 */
-    HWND h = FindWindowW(L"TaskManagerWindow", NULL);
-    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
-    h = FindWindowW(L"#32770", L"Windows 任务管理器");
-    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
-    /* Ctrl+Alt+Del 安全界面（Windows 10/11） */
-    h = FindWindowW(L"Windows.UI.Core.CoreWindow", NULL);
-    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
-    /* 注销/切换用户界面 */
-    h = FindWindowW(L"#32770", L"注销");
-    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
-    h = FindWindowW(L"#32770", L"切换用户");
-    if (h) { PostMessage(h, WM_CLOSE, 0, 0); }
-    /* LogonUI （按 Ctrl+Alt+Del 后弹出的登录界面） */
-    ExecHidden(L"taskkill /f /im LogonUI.exe");
-    /* v4.12: 只做 TOPMOST 置顶，去掉 SetForegroundWindow，防止闪烁 */
-    if (g_hWndLock && IsWindow(g_hWndLock)) {
-        SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-    }
-}
-DWORD WINAPI WatchdogThread(LPVOID p) {
-    (void)p;
-    while (1) {
-        Sleep(300);  /* v4.10: 缩短间隔到 300ms，更快响应 Ctrl+Alt+Del */
-        if (g_bLocked) {
-            KillBypassWindows();
-        }
-    }
-    return 0;
-}
+/* v4.13: 锁屏功能已删除， KillBypassWindows 和 WatchdogThread 一并移除 */
 
-/* ============================================================
-   Guard 线程：锁屏时保持置顶
-   ============================================================ */
-DWORD WINAPI GuardThread(LPVOID p) {
-    (void)p;
-    while (1) {
-        Sleep(500);
-        /* v4.12: 只做 TOPMOST 置顶，不强制抢前景。
-         * v4.10/v4.11 的 SetForegroundWindow 每秒强制激活导致屏幕疯狂闪烁，
-         * 原因：系统和我们的窗口互相投票激活，就像两个人疯狂抢遥控器。
-         * TOPMOST 标志已经足够确保锁屏窗口在所有普通窗口之上。 */
-        if (g_bLocked && g_hWndLock && IsWindow(g_hWndLock)) {
-            SetWindowPos(g_hWndLock, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-        }
-    }
-    return 0;
-}
+/* v4.13: 锁屏功能已删除， GuardThread 一并移除 */
 
 /* ============================================================
    配置读写
@@ -2380,12 +2330,8 @@ static void RegisterHotkeys(HWND hWnd) {
         WriteLog(L"RegisterHotKey NETFIX failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_NETFIX_ALT, EMERGENCY_MOD_ALT, EMERGENCY_VK_ALT))
         WriteLog(L"RegisterHotKey NETFIX_ALT failed err=%lu", GetLastError());
-    if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, LOCK_VK)) {
-        WriteLog(L"RegisterHotKey LOCK (Ctrl+Alt+L) failed err=%lu, trying Ctrl+Alt+K", GetLastError());
-        /* Ctrl+Alt+L 可能被系统或其他程序占用，尝试备用键 */
-        if (!RegisterHotKey(hWnd, HOTKEY_LOCK, LOCK_MOD, 'K'))
-            WriteLog(L"RegisterHotKey LOCK (Ctrl+Alt+K) also failed err=%lu", GetLastError());
-    }
+    /* v4.13: 锁屏功能已删除，不再注册 HOTKEY_LOCK */
+    UnregisterHotKey(hWnd, HOTKEY_LOCK);  /* 确保旧版遗留的热键被清除 */
 }
 
 /* ============================================================
@@ -2414,18 +2360,14 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
 
-    /* v4.1: 禁用系统 Win+L 锁屏（组策略）
-     * 这样 Win+L 不会触发 Windows 自带锁屏，而是被我们的键盘钩子拦截
-     * 显示 Ubuntu 伪装界面。
-     * 注册表路径: HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System
-     * 值: DisableLockWorkstation = 1 */
+    /* v4.13: 去掉禁用 Win+L 的注册表操作，锁屏功能已删除，恢复 Win+L 正常工作。
+     * 同时在程序启动时主动删除旧版本可能遗留的注册表项 */
     {
         HKEY hKey;
-        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE,
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
             L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0, NULL, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &hKey, NULL) == ERROR_SUCCESS) {
-            DWORD val = 1;
-            RegSetValueExW(hKey, L"DisableLockWorkstation", 0, REG_DWORD, (LPBYTE)&val, sizeof(val));
+            0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+            RegDeleteValueW(hKey, L"DisableLockWorkstation");
             RegCloseKey(hKey);
         }
     }
@@ -2476,12 +2418,7 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     BOOL bAlt  = s_bModAlt;
     BOOL bWin  = s_bModWin;
 
-    /* v4.4: 拦截 Win+L，同时激活老板键 + Ubuntu 伪装锁屏。 */
-    if (!g_bLocked && bDown && bWin && vk == 'L') {
-        if (g_bBossMode) DoBossKey();
-        PostMessageW(g_hWndMain, WM_LOCK_SCREEN, 0, 0);
-        return 1;
-    }
+    /* v4.13: 删除锁屏功能， Win+L 不再拦截，正常传递给系统 */
 
     /* v4.9: Ctrl+Win+Alt 三键同时按下即触发老板键。
      * 完全使用局部状态变量，不再依赖 GetAsyncKeyState，彻底解决时序问题。
@@ -3051,15 +2988,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
         y+=28;
 
-        /* 锁屏密码 */
-        h=CreateWindowW(L"STATIC",L"锁屏解锁密码:",
-            WS_CHILD|WS_VISIBLE,8,y,120,20,hWnd,NULL,g_hInst,NULL);
-        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
-        h=CreateWindowW(L"EDIT",g_szLockPwd,
-            WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL,
-            135,y,230,22,hWnd,(HMENU)IDC_SET_SPWD,g_hInst,NULL);
-        SendMessage(h,WM_SETFONT,(WPARAM)hF,TRUE);
-        y+=28;
+        /* v4.13: 锁屏功能已删除，锁屏密码输入框不再显示 */
 
         /* 老板键修饰符 */
         h=CreateWindowW(L"STATIC",L"老板键修饰符:",
@@ -3243,7 +3172,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
         } else if(id==IDC_SET_SAVE) {
             /* 读取所有设置 */
             GetDlgItemTextW(hWnd,IDC_SET_LPWD,g_szLoginPwd,63);
-            GetDlgItemTextW(hWnd,IDC_SET_SPWD,g_szLockPwd,63);
+            /* v4.13: 锁屏功能已删除，不再读取锁屏密码 */
             GetDlgItemTextW(hWnd,IDC_SET_HL,g_szHideList,2047);
             int sel=(int)SendDlgItemMessageW(hWnd,IDC_SET_BMOD,CB_GETCURSEL,0,0);
             if(sel>=0&&sel<5) g_BossMod=g_nModVals[sel];
@@ -3310,7 +3239,7 @@ static void ShowSettingsWindow(void) {
     } else {
         /* 刷新控件内容 */
         SetDlgItemTextW(g_hWndSettings,IDC_SET_LPWD,g_szLoginPwd);
-        SetDlgItemTextW(g_hWndSettings,IDC_SET_SPWD,g_szLockPwd);
+        /* v4.13: 锁屏密码输入框已删除 */
         SetDlgItemTextW(g_hWndSettings,IDC_SET_HL,g_szHideList);
         WCHAR szVk[4]={(WCHAR)g_BossVk,0};
         /* v4.9: 当选择 Ctrl+Win+Alt 时禁用字母键输入框 */
@@ -3350,15 +3279,10 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             ShowLoginDialog();
         } else if(wParam==HOTKEY_NETFIX || wParam==HOTKEY_NETFIX_ALT) {
             StartDetachedThread(EmergencyFixThread, NULL);
-        } else if(wParam==HOTKEY_LOCK) {
-            PostMessageW(hWnd, WM_LOCK_SCREEN, 0, 0);
         }
         break;
-    case WM_LOCK_SCREEN:
-        DoLockScreen();
-        break;
+    /* v4.13: WM_LOCK_SCREEN 和 HOTKEY_LOCK 已删除 */
     case WM_BOSS_KEY:
-        /* v4.4: Win+L 联动 — 如果还没进入老板模式，自动触发 */
         if (!g_bBossMode) DoBossKey();
         break;
     case WM_SHOW_SETTINGS:
@@ -3432,8 +3356,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     ProtectProcess();
 
     /* 启动守护线程 */
-    StartDetachedThread(WatchdogThread, NULL);
-    StartDetachedThread(GuardThread, NULL);
+    /* v4.13: 锁屏功能已删除，不再启动 WatchdogThread/GuardThread */
     StartDetachedThread(IPGuardThread, NULL);
 
     /* 注册主窗口 */
