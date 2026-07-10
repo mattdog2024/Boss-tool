@@ -141,27 +141,20 @@
 #define HOTKEY_SETTINGS   1002
 #define HOTKEY_NETFIX     1003
 #define HOTKEY_NETFIX_ALT 1004
-#define HOTKEY_LOCK       1005   /* 锁屏热键 */
+/* v4.19: HOTKEY_LOCK 已删除（v4.13 锁屏功能移除后的残留宏） */
 
 #define EMERGENCY_MOD     (MOD_CONTROL|MOD_ALT)
 #define EMERGENCY_VK      VK_F12
 #define EMERGENCY_MOD_ALT (MOD_CONTROL|MOD_SHIFT)
 #define EMERGENCY_VK_ALT  VK_F12
 
-/* 锁屏热键：Ctrl+Alt+L */
-#define LOCK_MOD          (MOD_CONTROL|MOD_ALT)
-#define LOCK_VK           'L'
+/* v4.19: LOCK_MOD / LOCK_VK 已删除（v4.13 锁屏功能移除后的残留宏） */
 
 /* 自定义消息 */
-#define WM_LOCK_SCREEN   (WM_USER+10)
 #define WM_SHOW_SETTINGS (WM_USER+13)
 #define WM_BOSS_KEY      (WM_USER+14)  /* v4.4: Win+L 联动老板键 */
-#define WM_TRAY_ICON     (WM_USER+20)  /* v4.18: 托盘图标消息 */
-/* 托盘菜单命令 ID */
-#define IDM_TRAY_SETTINGS  1001
-#define IDM_TRAY_BOSS      1002
-#define IDM_TRAY_NETFIX    1003
-#define IDM_TRAY_EXIT      1004
+/* v4.19: WM_LOCK_SCREEN / WM_TRAY_ICON 已删除 */
+/* v4.19: IDM_TRAY_SETTINGS/BOSS/NETFIX/EXIT 已删除（托盘图标从未添加） */
 
 /* 控件ID */
 #define IDC_LOGIN_PWD    2001
@@ -2345,7 +2338,7 @@ static void RegisterHotkeys(HWND hWnd) {
     UnregisterHotKey(hWnd, HOTKEY_SETTINGS);
     UnregisterHotKey(hWnd, HOTKEY_NETFIX);
     UnregisterHotKey(hWnd, HOTKEY_NETFIX_ALT);
-    UnregisterHotKey(hWnd, HOTKEY_LOCK);
+    /* v4.19: HOTKEY_LOCK 已彻底删除（v4.13 锁屏功能移除后的残留宏） */
     /* v4.7: 默认修饰键组合 Ctrl+Win+Alt 由键盘钩子处理，
      * RegisterHotKey 无法注册纯修饰键组合（无字母键）。
      * 仅当用户自定义了非默认修饰键时才使用 RegisterHotKey。 */
@@ -2361,8 +2354,7 @@ static void RegisterHotkeys(HWND hWnd) {
         WriteLog(L"RegisterHotKey NETFIX failed err=%lu", GetLastError());
     if (!RegisterHotKey(hWnd, HOTKEY_NETFIX_ALT, EMERGENCY_MOD_ALT, EMERGENCY_VK_ALT))
         WriteLog(L"RegisterHotKey NETFIX_ALT failed err=%lu", GetLastError());
-    /* v4.13: 锁屏功能已删除，不再注册 HOTKEY_LOCK */
-    UnregisterHotKey(hWnd, HOTKEY_LOCK);  /* 确保旧版遗留的热键被清除 */
+    /* v4.19: HOTKEY_LOCK 死代码已彻底删除 */
 }
 
 /* ============================================================
@@ -2985,75 +2977,20 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             StartDetachedThread(EmergencyFixThread, NULL);
         }
         break;
-    /* v4.13: WM_LOCK_SCREEN 和 HOTKEY_LOCK 已删除 */
+    /* v4.19: WM_LOCK_SCREEN / WM_TRAY_ICON 已彻底删除（宏和处理函数一并清理） */
     case WM_BOSS_KEY:
         if (!g_bBossMode) DoBossKey();
         break;
     case WM_SHOW_SETTINGS:
         ShowSettingsWindow();
         break;
-    /* v4.18: 托盘图标消息处理 */
-    case WM_TRAY_ICON:
-        if (lParam == WM_RBUTTONUP || lParam == WM_LBUTTONUP) {
-            POINT pt;
-            GetCursorPos(&pt);
-            HMENU hMenu = CreatePopupMenu();
-            if (hMenu) {
-                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SETTINGS,
-                    g_bBossMode ? L"老板模式中... (设置)" : L"设置 (Ctrl+Alt+F10)");
-                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_BOSS,
-                    g_bBossMode ? L"退出老板模式" : L"进入老板模式 (Ctrl+Win+Alt)");
-                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_NETFIX, L"一键修复网络");
-                AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"退出程序");
-                /* 必须先把窗口置前景，否则 TrackPopupMenu 不工作 */
-                SetForegroundWindow(hWnd);
-                TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_RIGHTALIGN,
-                    pt.x, pt.y, 0, hWnd, NULL);
-                PostMessageW(hWnd, WM_NULL, 0, 0);
-                DestroyMenu(hMenu);
-            }
-        }
-        break;
+    /* v4.18: 托盘图标消息处理 — v4.19 删除（托盘图标从未实际添加） */
     case WM_COMMAND:
-        switch(LOWORD(wParam)) {
-        case IDM_TRAY_SETTINGS:
-            ShowLoginDialog();
-            break;
-        case IDM_TRAY_BOSS:
-            DoBossKey();
-            break;
-        case IDM_TRAY_NETFIX:
-            StartDetachedThread(EmergencyFixThread, NULL);
-            break;
-        case IDM_TRAY_EXIT:
-            /* 退出前如果在老板模式，先恢复工作IP */
-            if (g_bBossMode) {
-                InterlockedExchange((LONG*)&g_bBossMode, FALSE);
-                SetIPWork();
-            }
-            /* 删除托盘图标 */
-            {
-                NOTIFYICONDATAW nid = {0};
-                nid.cbSize = sizeof(nid);
-                nid.hWnd   = hWnd;
-                nid.uID    = 1;
-                Shell_NotifyIconW(NIM_DELETE, &nid);
-            }
-            DestroyWindow(hWnd);
-            break;
-        }
+        /* v4.19: IDM_TRAY_* 死代码已清理 — 托盘图标从未添加。 */
         break;
     case WM_DESTROY:
-        /* 确保托盘图标被删除 */
-        {
-            NOTIFYICONDATAW nid = {0};
-            nid.cbSize = sizeof(nid);
-            nid.hWnd   = hWnd;
-            nid.uID    = 1;
-            Shell_NotifyIconW(NIM_DELETE, &nid);
-        }
+        /* v4.19: 死代码已清理 — 托盘图标从未实际添加（NIM_ADD 从未调用），
+         * 因此 WM_DESTROY 里的 NIM_DELETE 是无效操作。 */
         PostQuitMessage(0);
         break;
     }
