@@ -1,5 +1,21 @@
 /*
- * BossTool v4.18 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.19 - Windows 7/8/10/11 隱形管理工具
+ *
+ * v4.19 修复 Win+L 锁屏后屏幕疯狂闪烁（根治）：
+ *   - 根因（终于定位）：v4.16 修复不完整 + LL 钩子状态卡死
+ *     1. 快速 Alt+Tab 切窗口时，Ctrl/Alt UP 事件可能被 Windows
+ *        LowLevelHooksTimeout（默认 300ms）跳过，s_bModCtrl/s_bModAlt
+ *        永远卡在 TRUE
+ *     2. 下次按 Win+L 时，KeyboardHookProc 的 `(vk == VK_LWIN)
+ *        && bCtrl && bAlt` 条件满足 → return 1 吃掉 Win 键
+ *     3. 系统只收到 L 键，Win 键处于"按下但没收到对应 UP"状态
+ *        → 开始菜单循环 → 屏幕疯狂闪烁 → 必须重启
+ *   - 修复：
+ *     1. 键盘钩子状态变量超时自愈：每个修饰键状态记录
+ *        GetTickCount() 时间戳，超过 5 秒无对应 UP 事件视为卡死，
+ *        自动重置状态变量。
+ *     2. KeyboardHookProc 简化：移除 v4.9 的 bCtrl/bAlt/bWin
+ *        局部副本不一致，统一直接使用 s_bModCtrl/s_bModAlt。
  *
  * v4.4 速度优化 + Win+L 联动：
  *   - 老板键切换从 ~20秒 优化到 <5秒：
@@ -103,7 +119,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      13   /* v4.18: 设置菜单加退出按鈕 */
+#define CONFIG_VERSION      14   /* v4.19: 修复 Win+L 闪烁 — 键盘钩子状态卡死自愈 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -212,6 +228,26 @@ static volatile BOOL s_bBossComboTriggered = FALSE;
 static volatile BOOL s_bModCtrl = FALSE;  /* Ctrl 键当前状态 */
 static volatile BOOL s_bModWin  = FALSE;  /* Win  键当前状态 */
 static volatile BOOL s_bModAlt  = FALSE;  /* Alt  键当前状态 */
+
+/* v4.19: 修饰键状态时间戳 — 防止 LL 钩子超时导致状态卡住
+ *
+ * 背景：WH_KEYBOARD_LL 钩子如果在 LowLevelHooksTimeout（默认 300ms）
+ * 内没返回，Windows 会强制跳过该次钩子调用，相应按键事件不会被钩子处理。
+ * 在用户快速 Alt+Tab / Alt+Esc 切换窗口，或系统繁忙时，Ctrl/Alt 的 UP
+ * 事件可能被跳过，导致 s_bModCtrl/s_bModAlt 永远卡在 TRUE。
+ *
+ * 后果：下次按 Win+L 时，KeyboardHookProc 行 2472 的
+ *      `(vk == VK_LWIN) && bCtrl && bAlt` 条件满足 → return 1 吃掉
+ *      Win 键 → 系统只收到 L 键 → Win 键卡死状态触发开始菜单循环 →
+ *      屏幕疯狂闪烁。
+ *
+ * 修复：每次状态变量更新时记录 GetTickCount() 时间戳。
+ *      钩子入口检查时间戳，超过 MOD_STALE_MS（5秒）无对应 UP 事件
+ *      视为状态卡死，自动重置。 */
+static volatile DWORD s_dwModCtrlTime = 0;
+static volatile DWORD s_dwModAltTime  = 0;
+static volatile DWORD s_dwModWinTime  = 0;
+#define MOD_STALE_MS  5000  /* 5秒无对应UP事件视为状态卡死 */
 
 /* v4.3: WriteLog 线程安全锁 — WatchdogThread/GuardThread/IPGuardThread/BossKeyThread
  * 都并发调用 WriteLog，无锁时多个线程同时 CreateFile/WriteFile 会导致
@@ -2437,30 +2473,59 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     UINT vk = kb->vkCode;
     BOOL bDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
 
+    /* v4.19: 状态卡死自愈 — 检测时间戳超时的修饰键状态，自动重置。
+     * 见 s_dwModCtrlTime/s_dwModAltTime/s_dwModWinTime 定义处的注释。
+     * 关键场景：用户快速 Alt+Tab 切窗口时 Ctrl/Alt UP 事件被 LL 钩子
+     * 超时跳过，s_bModCtrl/s_bModAlt 卡在 TRUE → 下次按 Win+L 闪烁。
+     */
+    {
+        DWORD dwNow = GetTickCount();
+        if (s_bModCtrl && s_dwModCtrlTime != 0 &&
+            (dwNow - s_dwModCtrlTime) > MOD_STALE_MS) {
+            s_bModCtrl = FALSE;
+            s_dwModCtrlTime = 0;
+            s_bBossComboTriggered = FALSE;
+        }
+        if (s_bModAlt && s_dwModAltTime != 0 &&
+            (dwNow - s_dwModAltTime) > MOD_STALE_MS) {
+            s_bModAlt = FALSE;
+            s_dwModAltTime = 0;
+            s_bBossComboTriggered = FALSE;
+        }
+        if (s_bModWin && s_dwModWinTime != 0 &&
+            (dwNow - s_dwModWinTime) > MOD_STALE_MS) {
+            s_bModWin = FALSE;
+            s_dwModWinTime = 0;
+            s_bBossComboTriggered = FALSE;
+        }
+    }
+
     /* v4.9: 用局部状态变量跟踪修饰键状态，而不依赖 GetAsyncKeyState。
      * GetAsyncKeyState 在低级键盘钩子回调中存在时序问题：
      * 当 Alt 键触发 WM_SYSKEYDOWN 时，GetAsyncKeyState(VK_MENU) 可能还没有更新，
-     * 导致三键同时按下时判断失败。 */
+     * 导致三键同时按下时判断失败。
+     *
+     * v4.19: 同时记录时间戳，供上面超时自愈逻辑使用。 */
     if (vk == VK_LCONTROL || vk == VK_RCONTROL) {
         s_bModCtrl = bDown;
-        if (!bDown) s_bBossComboTriggered = FALSE;
+        if (bDown) s_dwModCtrlTime = GetTickCount();
+        else { s_dwModCtrlTime = 0; s_bBossComboTriggered = FALSE; }
     } else if (vk == VK_LMENU || vk == VK_RMENU) {
         s_bModAlt = bDown;
-        if (!bDown) s_bBossComboTriggered = FALSE;
+        if (bDown) s_dwModAltTime = GetTickCount();
+        else { s_dwModAltTime = 0; s_bBossComboTriggered = FALSE; }
     } else if (vk == VK_LWIN || vk == VK_RWIN) {
         s_bModWin = bDown;
-        if (!bDown) s_bBossComboTriggered = FALSE;
+        if (bDown) s_dwModWinTime = GetTickCount();
+        else { s_dwModWinTime = 0; s_bBossComboTriggered = FALSE; }
     }
-
-    /* 以下依然使用 GetAsyncKeyState 用于 Win+L 拦截和锁屏输入 */
-    BOOL bCtrl = s_bModCtrl;
-    BOOL bAlt  = s_bModAlt;
-    BOOL bWin  = s_bModWin;
 
     /* v4.13: 删除锁屏功能， Win+L 不再拦截，正常传递给系统 */
 
-    /* v4.9: Ctrl+Win+Alt 三键同时按下即触发老板键。
-     * 完全使用局部状态变量，不再依赖 GetAsyncKeyState，彻底解决时序问题。
+    /* v4.19: Ctrl+Win+Alt 三键同时按下即触发老板键。
+     * 完全使用 s_bModCtrl/s_bModWin/s_bModAlt（v4.16 之后已经一致），
+     * 修复合并 v4.9 的 bCtrl/bAlt/bWin 局部副本可能与更新后的 s_*
+     * 不一致的潜在 bug（虽然之前 v4.16 已规避，但用全局更稳）。
      * 三键中任意一键按下时，检查另两键是否已按着，满足则触发。
      * 同时吃掉 Win 键事件防止开始菜单弹出。 */
     if (g_BossMod == DEFAULT_BOSS_MOD) {
@@ -2468,8 +2533,11 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
          * 之前的逻辑是"Ctrl 或 Alt 任意一个按着就吃掉 Win 键"，
          * 这会导致 Win+L 时如果 s_bModCtrl/s_bModAlt 因上次操作遗留为 TRUE，
          * Win 键事件被吃掉，系统收不到完整的 Win+L → 屏幕疯狂闪烁。
-         * 新逻辑：必须三键全部同时按着才吃掉 Win 键，Win+L 绝不受影响。 */
-        if ((vk == VK_LWIN || vk == VK_RWIN) && bCtrl && bAlt) {
+         * 新逻辑：必须三键全部同时按着才吃掉 Win 键，Win+L 绝不受影响。
+         *
+         * v4.19: 同时配合上面的超时自愈，即使 s_bModCtrl/s_bModAlt 真的
+         * 卡住，5秒后也会被自动重置，Win+L 永远不会被误拦截。 */
+        if ((vk == VK_LWIN || vk == VK_RWIN) && s_bModCtrl && s_bModAlt) {
             /* 三键全部按着，吃掉 Win 键防止开始菜单 */
             return 1;
         }
