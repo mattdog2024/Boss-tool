@@ -1993,8 +1993,24 @@ static BOOL AdapterHasIP(const WCHAR *expectedIP) {
 DWORD WINAPI IPGuardThread(LPVOID p) {
     (void)p;
     Sleep(10000);  /* v4.2: 启动等待更长，避免和 InitialIPThread 冲突 */
+    /* v4.19: 注册表策略项周期性再清理 — 每 24 小时一次
+     * 见 CleanupLockWorkstationPolicy() 注释了解根因。 */
+    DWORD dwLastPolicyCleanupTick = 0;
+    const DWORD POLICY_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;  /* 24h */
     while (1) {
         Sleep(15000);  /* v4.2: 5秒→15秒，减少 GetAdaptersInfo 调用和网络栈压力 */
+
+        /* v4.19: 周期性清理锁屏策略项（运行中被域控/第三方重新设置时兜底） */
+        {
+            DWORD dwNow = GetTickCount();
+            if (dwLastPolicyCleanupTick == 0) {
+                dwLastPolicyCleanupTick = dwNow;
+            } else if ((dwNow - dwLastPolicyCleanupTick) >= POLICY_CLEANUP_INTERVAL_MS) {
+                dwLastPolicyCleanupTick = dwNow;
+                CleanupLockWorkstationPolicy();
+            }
+        }
+
         if (g_bAllowIPChange || g_szExpectedIP[0] == 0) continue;
         if (g_lNetworkChangeBusy) continue;
 
@@ -2413,31 +2429,69 @@ static DWORD WINAPI VaultEjectThread(LPVOID p) {
     return 0;
 }
 
+/* v4.19: 清理禁用 Win+L 锁屏的注册表项（提取为公用函数）
+ *
+ * 背景：v4.14 在 InitialIPThread 里实现了 DisableLockWorkstation 的清理，
+ * 但只在启动时执行一次。如果运行中该项被重新设置（域控策略推送、
+ * 第三方软件、安装旧版 BossTool 残留），Win+L 锁屏就会再次失效。
+ *
+ * v4.19 改进：
+ * 1. 提取为独立函数 CleanupLockWorkstationPolicy，启动时 + 周期
+ *    性（IPGuardThread 内 24 小时一次）都调用。
+ * 2. 同时清理其他相关项：
+ *    - DisableLockWorkstation（DWORD=1 直接禁用 Win+L）
+ *    - NoLockScreen（Windows 10 1903+ 引入的另一种禁用方式）
+ *    - DisableChangePassword（部分组策略模板会附带）
+ * 3. 使用两种方式确保删除：
+ *    a. 直接 RegDeleteValueW（程序已管理员权限）
+ *    b. 备用 reg.exe 命令（兼容权限错误场景，静默执行）
+ *
+ * 注意：HKLM 下的策略键如果被域控推送，本机管理员可能没有写权限。
+ * 这种情况下 reg.exe 也会失败（这是 Windows 安全设计，不是 bug）。
+ * 这种情况用户需要联系 IT 部门解除策略。 */
+static void CleanupLockWorkstationPolicy(void) {
+    HKEY hKey;
+    BOOL bAnyDeleted = FALSE;
+    LPCWSTR rgValuesToDelete[] = {
+        L"DisableLockWorkstation",
+        L"NoLockScreen",
+        L"DisableChangePassword",
+        NULL
+    };
+
+    /* 方式1: 直接 API 删除 */
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
+        for (int i = 0; rgValuesToDelete[i]; i++) {
+            if (RegDeleteValueW(hKey, rgValuesToDelete[i]) == ERROR_SUCCESS) {
+                bAnyDeleted = TRUE;
+                WriteLog(L"v4.19: 已删除注册表项 %ls", rgValuesToDelete[i]);
+            }
+        }
+        RegCloseKey(hKey);
+    }
+
+    /* 方式2: 备用 reg delete 命令（兼容权限/路径异常） */
+    for (int i = 0; rgValuesToDelete[i]; i++) {
+        WCHAR szCmd[256];
+        _snwprintf(szCmd, 255,
+            L"reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v %ls /f",
+            rgValuesToDelete[i]);
+        ExecHidden(szCmd);
+    }
+
+    if (!bAnyDeleted) {
+        WriteLog(L"v4.19: 注册表项无需清理（不存在或权限不足）");
+    }
+}
+
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
     (void)pParam;
 
-    /* v4.14: 强制删除旧版本遗留的 DisableLockWorkstation 注册表项。
-     * 该项会导致 Win+L 按下后屏幕疯狂闪烁。
-     * 使用两种方式确保删除成功：
-     * 1. 直接 RegDeleteValue（程序本身已管理员权限）
-     * 2. 备用 reg delete 命令（静默执行，不弹窗口） */
-    {
-        /* 方式1: 直接 API 删除 */
-        HKEY hKey;
-        BOOL bDeleted = FALSE;
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0, KEY_SET_VALUE | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-            if (RegDeleteValueW(hKey, L"DisableLockWorkstation") == ERROR_SUCCESS)
-                bDeleted = TRUE;
-            RegCloseKey(hKey);
-        }
-        /* 方式2: 备用 reg delete 命令（静默，不弹窗口） */
-        if (!bDeleted) {
-            ExecHidden(L"reg delete \"HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System\" /v DisableLockWorkstation /f");
-        }
-        WriteLog(L"v4.14: 已尝试删除 DisableLockWorkstation 注册表项 (bDeleted=%d)", (int)bDeleted);
-    }
+    /* v4.19: 启动时清理 Win+L 锁屏策略项。
+     * 详见 CleanupLockWorkstationPolicy() 函数注释。 */
+    CleanupLockWorkstationPolicy();
 
     /* v3.5: 启动时扫描并卸载旧版遗留的VHDX（更换版本后第一次运行） */
     VaultRecoverAndEject();
