@@ -1,5 +1,11 @@
 /*
- * BossTool v4.19 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.19.1 - Windows 7/8/10/11 隱形管理工具
+ *
+ * v4.19.1 hotfix: 修复 v4.19 编译失败
+ *   - v4.19 漏加 CleanupLockWorkstationPolicy 的前向声明，
+ *     导致 IPGuardThread 在 CleanupLockWorkstationPolicy 定义之前
+ *     调用它 → implicit declaration warning + linker error
+ *   - 已在行 308-312 区域加 `static void CleanupLockWorkstationPolicy(void);`
  *
  * v4.19 修复 Win+L 锁屏后屏幕疯狂闪烁（根治）：
  *   - 根因（终于定位）：v4.16 修复不完整 + LL 钩子状态卡死
@@ -119,7 +125,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      14   /* v4.19: 修复 Win+L 闪烁 — 键盘钩子状态卡死自愈 */
+#define CONFIG_VERSION      15   /* v4.19.1: 修复 v4.19 编译失败（漏前向声明） */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -310,6 +316,10 @@ DWORD WINAPI     BossKeyThread(LPVOID);
 static DWORD WINAPI VaultEjectThread(LPVOID);
 DWORD WINAPI     InitialIPThread(LPVOID);
 DWORD WINAPI     EmergencyFixThread(LPVOID);
+/* v4.19: CleanupLockWorkstationPolicy 前向声明
+ * IPGuardThread 在 CleanupLockWorkstationPolicy 定义之前调用它，
+ * 需要先声明（C90 implicit declaration 在 MinGW 严格模式下会报错）。 */
+static void     CleanupLockWorkstationPolicy(void);
 
 static void DoBossKey(void);
 static void ApplyIP(const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*, const WCHAR*);
