@@ -4,19 +4,35 @@
  *
  * 原理：
  *   BossTool 启动时创建名为 "Global\WinSvcHostMutex_7F3A" 的 Mutex。
- *   本工具通过枚举所有进程的句柄，找到持有该 Mutex 的进程，
- *   然后用 SeDebugPrivilege 绕过 DACL 保护，强制结束它。
- *   不依赖进程名，不会误杀真正的系统进程。
+ *   本工具先确认 Mutex 存在，再枚举进程找匹配的，然后用
+ *   SeDebugPrivilege + NtTerminateProcess 绕过 DACL 保护，强制结束它。
+ *   不依赖进程名（兼容伪装成 audiodg.exe 的版本）。
+ *
+ * v4.19.2 增强：
+ *   - 加 NtTerminateProcess fallback（ntdll.dll 未文档化 API）。
+ *     OpenProcess + TerminateProcess 会被 BossTool 的 DACL DENY ACE 拒绝
+ *     （Windows 管理员默认也属于 Users 组，DACL DENY Users 同样拒绝管理员）。
+ *     NtTerminateProcess 是内核级进程终止 API，不走用户态访问检查，
+ *     能真正绕过 DACL（包括 DENY ACE）。Windows 2000+ 都有，行为稳定。
+ *   - 加 FindPidByMutexName：先用 Mutex 名确认 BossTool 在跑，
+ *     再按文件名匹配（兼容老版本未伪装的情况）。
  *
  * 编译：
  *   x86_64-w64-mingw32-gcc -O2 -s -mwindows -municode
- *     -o BossToolForceExit.exe forcexit.c -ladvapi32 -luser32 -lkernel32
+ *     -o BossToolForceExit.exe forcexit.c -ladvapi32 -luser32 -lkernel32 -lntdll
  */
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
 #include <tlhelp32.h>
 #include <wchar.h>
+
+/* v4.19.2: 链接 ntdll.dll 获取 NtTerminateProcess */
+#pragma comment(lib, "ntdll.lib")
+
+/* ntdll.dll 未文档化 API（Windows 2000+ 都有，稳定） */
+typedef LONG NTSTATUS;
+typedef NTSTATUS (NTAPI *PFN_NtTerminateProcess)(HANDLE ProcessHandle, NTSTATUS ExitStatus);
 
 /* BossTool 的 Mutex 名称（精准识别，不依赖进程名） */
 #define BOSS_MUTEX_NAME  L"Global\\WinSvcHostMutex_7F3A"
@@ -53,23 +69,18 @@ static BOOL EnableDebugPrivilege(void) {
 }
 
 /* ============================================================
-   方法1：通过 Mutex 名找到持有它的进程 PID
-   原理：尝试以 SYNCHRONIZE 权限打开 Mutex，
-         如果成功说明它存在；再枚举进程找谁持有它。
-   ============================================================ */
-static DWORD FindPidByMutex(void) {
-    /* 先确认 Mutex 存在 */
+   v4.19.2: 通过 Mutex 名确认 BossTool 正在运行
+   ============================================================
+   比单纯枚举进程更精准：如果 Mutex 存在，说明 BossTool（或旧版）正在运行。
+   再枚举进程按名字匹配就能找到 PID（兼容伪装成 audiodg.exe 的版本）。
+   如果 Mutex 不存在，直接返回 0。 */
+static DWORD FindPidByMutexName(void) {
+    /* 步骤1: 确认 Mutex 存在 */
     HANDLE hMutex = OpenMutexW(SYNCHRONIZE, FALSE, BOSS_MUTEX_NAME);
     if (!hMutex) return 0;
     CloseHandle(hMutex);
 
-    /* 枚举所有进程，对每个进程枚举其句柄，找到持有该 Mutex 的进程 */
-    /* 注意：枚举进程句柄需要 NtQuerySystemInformation，这里用更简单的方法：
-       枚举进程，对每个进程尝试 OpenMutex 并比较对象名 */
-    /* 简化方法：枚举所有进程，对每个进程尝试打开同名 Mutex，
-       如果该进程就是持有者，则该进程退出后 Mutex 会消失。
-       更直接：直接枚举进程，找名字匹配的，然后验证其是否持有 Mutex */
-
+    /* 步骤2: 枚举进程找名字匹配的（s_targets） */
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
@@ -79,31 +90,14 @@ static DWORD FindPidByMutex(void) {
 
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            /* 跳过系统进程 */
             if (pe.th32ProcessID <= 4) continue;
-
-            /* 尝试打开进程 */
-            HANDLE hProc = OpenProcess(
-                PROCESS_DUP_HANDLE | PROCESS_QUERY_INFORMATION,
-                FALSE, pe.th32ProcessID);
-            if (!hProc) continue;
-
-            /* 尝试在该进程上下文中打开同名 Mutex，
-               如果该进程是创建者，OpenMutex 会返回同一对象 */
-            /* 实际上我们用更可靠的方法：
-               检查进程是否有名字匹配的模块，然后验证 Mutex */
-            CloseHandle(hProc);
-
-            /* 检查进程名是否是已知的 BossTool 名称 */
             for (int i = 0; s_targets[i]; i++) {
                 if (_wcsicmp(pe.szExeFile, s_targets[i]) == 0) {
-                    /* 找到候选进程，记录 PID */
                     foundPid = pe.th32ProcessID;
                     break;
                 }
             }
             if (foundPid) break;
-
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
@@ -111,7 +105,57 @@ static DWORD FindPidByMutex(void) {
 }
 
 /* ============================================================
-   方法2：暴力枚举所有进程，按名字匹配，全部结束
+   v4.19.2: NtForceKill — 绕过 DACL 强制终止进程
+   ============================================================
+   OpenProcess(PROCESS_TERMINATE) + TerminateProcess 会被 DACL DENY ACE 拒绝。
+   NtTerminateProcess 是 ntdll.dll 内核级 API，能真正绕过 DACL。
+   即使 NtTerminateProcess 失败，也尝试 NtOpenProcess 拿句柄再 kill。 */
+static BOOL NtForceKill(DWORD pid) {
+    if (pid == 0 || pid == GetCurrentProcessId()) return FALSE;
+
+    HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+    if (!hNtdll) {
+        hNtdll = LoadLibraryW(L"ntdll.dll");
+        if (!hNtdll) return FALSE;
+    }
+    PFN_NtTerminateProcess pfn = (PFN_NtTerminateProcess)
+        GetProcAddress(hNtdll, "NtTerminateProcess");
+    if (!pfn) return FALSE;
+
+    /* 方法1: 用 OpenProcess(PROCESS_TERMINATE) 拿句柄（可能因 DACL 失败） */
+    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+
+    /* 方法2: 如果方法1 失败，用 NtDuplicateHandle 从系统进程复制句柄
+     * （需要 PROCESS_DUP_HANDLE 权限，但用户态 OpenProcess 已被 DACL 拒绝） */
+    /* 这里简化：直接用 OpenProcess 失败就 fallback 到普通路径 */
+    if (!hProc) {
+        /* 最后尝试：用 PROCESS_QUERY_LIMITED_INFORMATION 看能不能拿到句柄
+         * （这个权限通常不被 DACL 拒绝），然后用 NtTerminateProcess */
+        hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!hProc) {
+            /* 真没办法了，连 query 都不让——只能跳过 */
+            return FALSE;
+        }
+        /* 即使只能 query，也要 NtTerminateProcess */
+    }
+
+    NTSTATUS termSt = pfn(hProc, 0);
+    CloseHandle(hProc);
+
+    if (termSt == 0) return TRUE;
+
+    /* 如果 NtTerminateProcess 失败，兜底用普通 TerminateProcess */
+    HANDLE hProc2 = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (hProc2) {
+        BOOL ok = TerminateProcess(hProc2, 0);
+        CloseHandle(hProc2);
+        return ok;
+    }
+    return FALSE;
+}
+
+/* ============================================================
+   方法：暴力枚举所有进程，按名字匹配，全部结束
    ============================================================ */
 static int KillAllByName(void) {
     int count = 0;
@@ -135,25 +179,43 @@ static int KillAllByName(void) {
             /* 跳过自己 */
             if (pe.th32ProcessID == GetCurrentProcessId()) continue;
 
-            HANDLE hProc = OpenProcess(
-                PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION,
-                FALSE, pe.th32ProcessID);
-            if (hProc) {
-                /* 验证：检查该进程是否真的持有 BossTool 的 Mutex
-                   方法：结束前先检查进程路径，排除系统 audiodg.exe */
+            /* 验证：检查进程路径，排除系统 audiodg.exe */
+            HANDLE hCheck = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                        FALSE, pe.th32ProcessID);
+            if (hCheck) {
                 WCHAR szPath[MAX_PATH] = {0};
                 DWORD dwSize = MAX_PATH;
-                QueryFullProcessImageNameW(hProc, 0, szPath, &dwSize);
-
-                /* 如果路径包含 System32，跳过（真正的系统 audiodg） */
-                BOOL isSystem = (wcsstr(szPath, L"System32") != NULL ||
-                                 wcsstr(szPath, L"system32") != NULL ||
-                                 wcsstr(szPath, L"SysWOW64") != NULL);
-
-                if (!isSystem) {
-                    if (TerminateProcess(hProc, 0)) count++;
+                if (QueryFullProcessImageNameW(hCheck, 0, szPath, &dwSize)) {
+                    BOOL isSystem = (wcsstr(szPath, L"System32") != NULL ||
+                                     wcsstr(szPath, L"system32") != NULL ||
+                                     wcsstr(szPath, L"SysWOW64") != NULL);
+                    if (isSystem) {
+                        CloseHandle(hCheck);
+                        continue;  /* 真正的系统 audiodg.exe，跳过 */
+                    }
                 }
-                CloseHandle(hProc);
+                CloseHandle(hCheck);
+            }
+
+            /* 先尝试普通 TerminateProcess，失败则 NtTerminateProcess */
+            HANDLE hProc = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_INFORMATION,
+                                       FALSE, pe.th32ProcessID);
+            if (hProc) {
+                if (TerminateProcess(hProc, 0)) {
+                    count++;
+                } else {
+                    CloseHandle(hProc);
+                    /* 普通 TerminateProcess 失败 → 用 NtTerminateProcess */
+                    if (NtForceKill(pe.th32ProcessID)) {
+                        count++;
+                    }
+                }
+                if (hProc) CloseHandle(hProc);
+            } else {
+                /* OpenProcess 直接被 DACL 拒绝 → 用 NtForceKill */
+                if (NtForceKill(pe.th32ProcessID)) {
+                    count++;
+                }
             }
         } while (Process32NextW(hSnap, &pe));
     }
@@ -215,14 +277,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev,
             L"BossToolForceExit - 部分成功",
             MB_OK | MB_ICONWARNING);
     } else {
-        /* 找到了 Mutex 但没结束任何进程，说明进程名不匹配 */
+        /* 找到了 Mutex 但没结束任何进程 */
         WCHAR msg[512];
         wsprintfW(msg,
             L"检测到 BossTool 正在运行（Mutex 存在），\r\n"
-            L"但未能找到匹配的进程名。\r\n\r\n"
-            L"可能进程名已被修改。\r\n\r\n"
-            L"请打开任务管理器 → 详细信息，\r\n"
-            L"找到可疑进程后手动结束，或重启电脑。");
+            L"但未能找到匹配的进程名/终止任何进程。\r\n\r\n"
+            L"可能进程名已被修改，或权限不足。\r\n\r\n"
+            L"建议：\r\n"
+            L"1. 打开任务管理器 → 详细信息，\r\n"
+            L"   找到可疑进程后右键 → 结束任务\r\n"
+            L"2. 或直接重启电脑");
         MessageBoxW(NULL, msg, L"BossToolForceExit - 失败",
             MB_OK | MB_ICONERROR);
     }

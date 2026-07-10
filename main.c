@@ -1,5 +1,19 @@
 /*
- * BossTool v4.19.1 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.19.2 - Windows 7/8/10/11 隱形管理工具
+ *
+ * v4.19.2 hotfix: 修复 BossToolKiller / BossToolForceExit 杀不掉老版本残留
+ *   - 根因 1：ProtectProcess 设的 DACL 用 SetEntriesInAclW 插入 DENY Users，
+ *     Windows 管理员默认也属于 Users 组，所以管理员的 OpenProcess 被
+ *     DENY ACE 拒绝。SeDebugPrivilege 不能 bypass DENY ACE。
+ *     修复：DACL 顺序改为 [ALLOW Administrators, DENY Users, 原 ACE...]。
+ *   - 根因 2：v4.18 的"退出程序"按钮同步调用 SetIPWork（含 Sleep(2000)
+ *     + 切换网卡），如果网络有问题阻塞主线程，永远到不了 DestroyWindow。
+ *     修复：SetIPWork 改为 detached thread 异步执行，主线程立即 DestroyWindow。
+ *   - 根因 3：BossToolKiller.c 之前没启用 SeDebugPrivilege。
+ *     修复：加上 EnableDebugPrivilege()。
+ *   - 根因 4：BossToolKiller.c 进程名只匹配 BossTool.exe / BossTool_x86.exe，
+ *     没匹配 BossTool 进程伪装成的 audiodg.exe（v4.11+ 引入）。
+ *     修复：匹配列表加上 audiodg.exe。
  *
  * v4.19.1 hotfix: 修复 v4.19 编译失败
  *   - v4.19 漏加 CleanupLockWorkstationPolicy 的前向声明，
@@ -125,7 +139,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      15   /* v4.19.1: 修复 v4.19 编译失败（漏前向声明） */
+#define CONFIG_VERSION      16   /* v4.19.2: 修复 BossToolKiller/ForceExit 杀不掉残留 + DACL 拒绝管理员 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -1465,7 +1479,16 @@ static void ProtectProcess(void) {
     /* v4.12: 第二步：修改自身进程的 DACL
      * 策略：只拒绝 "Users" 组（普通用户）的 PROCESS_TERMINATE
      *         管理员组不受限制，依然可以用专用工具结束进程
-     * v4.11 的错误：拒绝 Everyone 把管理员自己也锁死了 */
+     * v4.11 的错误：拒绝 Everyone 把管理员自己也锁死了
+     *
+     * v4.19.2 修复 v4.12 的隐藏 bug：
+     *   Windows 管理员默认也属于 Users 组（Microsoft 设计），所以 v4.12 单纯
+     *   拒绝 Users 也会拒绝管理员自己，导致 BossToolKiller/BossToolForceExit
+     *   杀不掉（OpenProcess 被 DACL 拒绝拿不到句柄，SeDebugPrivilege 也不能
+     *   bypass DENY ACE）。
+     *   修复：DACL 顺序改为 [ALLOW Administrators, DENY Users, 原 ACE...]，
+     *   ALLOW Administrators ACE 在 DENY Users 之前，DACL 查找时第一个匹配
+     *   的 ACE 生效 → 管理员永远匹配 ALLOW 通过；普通用户匹配 DENY 拒绝。 */
     {
         HANDLE hProc = GetCurrentProcess();
         PSECURITY_DESCRIPTOR pSD = NULL;
@@ -1473,17 +1496,26 @@ static void ProtectProcess(void) {
         if (GetSecurityInfo(hProc, SE_KERNEL_OBJECT,
                             DACL_SECURITY_INFORMATION,
                             NULL, NULL, &pOldDacl, NULL, &pSD) == ERROR_SUCCESS) {
-            EXPLICIT_ACCESS_W ea[1];
+            EXPLICIT_ACCESS_W ea[2];
             ZeroMemory(ea, sizeof(ea));
-            /* 只拒绝 Users 组（普通用户），不拒绝 Administrators */
-            ea[0].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
-            ea[0].grfAccessMode        = DENY_ACCESS;
+            /* ACE 1: 先 ALLOW Administrators（管理员永远通过） */
+            ea[0].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                                         PROCESS_CREATE_THREAD | PROCESS_DUP_HANDLE |
+                                         READ_CONTROL | PROCESS_QUERY_INFORMATION;
+            ea[0].grfAccessMode        = GRANT_ACCESS;
             ea[0].grfInheritance       = NO_INHERITANCE;
             ea[0].Trustee.TrusteeForm  = TRUSTEE_IS_NAME;
             ea[0].Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
-            ea[0].Trustee.ptstrName    = (LPWSTR)L"Users";
+            ea[0].Trustee.ptstrName    = (LPWSTR)L"Administrators";
+            /* ACE 2: 再 DENY Users（普通用户被拒绝，不影响管理员因为已 ALLOW） */
+            ea[1].grfAccessPermissions = PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION;
+            ea[1].grfAccessMode        = DENY_ACCESS;
+            ea[1].grfInheritance       = NO_INHERITANCE;
+            ea[1].Trustee.TrusteeForm  = TRUSTEE_IS_NAME;
+            ea[1].Trustee.TrusteeType  = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            ea[1].Trustee.ptstrName    = (LPWSTR)L"Users";
             PACL pNewDacl = NULL;
-            if (SetEntriesInAclW(1, ea, pOldDacl, &pNewDacl) == ERROR_SUCCESS) {
+            if (SetEntriesInAclW(2, ea, pOldDacl, &pNewDacl) == ERROR_SUCCESS) {
                 SetSecurityInfo(hProc, SE_KERNEL_OBJECT,
                                 DACL_SECURITY_INFORMATION,
                                 NULL, NULL, pNewDacl, NULL);
@@ -2527,6 +2559,14 @@ DWORD WINAPI InitialIPThread(LPVOID pParam) {
     return 0;
 }
 
+/* v4.19.2: SetIPWorkThread wrapper — 让 SetIPWork 能在 detached thread 中运行
+ * 用于退出按钮异步化：用户点退出时不阻塞主线程 */
+static DWORD WINAPI SetIPWorkThread(LPVOID p) {
+    (void)p;
+    SetIPWork();
+    return 0;
+}
+
 static void DoBossKey(void) {
     if (!g_bBossMode) {
         InterlockedExchange((LONG*)&g_bBossMode, TRUE);
@@ -3003,20 +3043,28 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
             SetIPWork();
             MessageBoxW(hWnd,L"工作IP已应用！",L"提示",MB_OK);
         } else if(id==IDC_SET_EXIT) {
-            /* v4.18: 退出程序 */
+            /* v4.18: 退出程序
+             * v4.19.2: 异步化 SetIPWork，避免主线程卡住永远到不了 DestroyWindow。
+             * 之前的 bug：如果老板模式时点退出，主线程同步调用 SetIPWork，
+             *          而 SetIPWork 包含 Sleep(2000) + 切换网卡，如果网络
+             *          有问题可能阻塞数十秒，导致用户感觉"程序没反应"。 */
             int ret = MessageBoxW(hWnd,
                 L"确定要退出 BossTool 吗？\r\n如果当前处于老板模式，退出前会自动恢复工作IP。",
                 L"退出确认", MB_YESNO | MB_ICONQUESTION);
             if (ret == IDYES) {
-                /* 如果在老板模式，先恢复工作IP */
-                if (g_bBossMode) {
-                    InterlockedExchange((LONG*)&g_bBossMode, FALSE);
-                    SetIPWork();
-                }
                 /* 关闭设置窗口 */
                 ShowWindow(hWnd, SW_HIDE);
-                /* 退出主程序 */
+                /* 退出主程序（不阻塞） */
                 DestroyWindow(g_hWndMain);
+                /* v4.19.2: 如果在老板模式，异步恢复工作IP（不等它完成） */
+                if (g_bBossMode) {
+                    InterlockedExchange((LONG*)&g_bBossMode, FALSE);
+                    /* 用 detached thread 异步恢复网络，避免阻塞进程退出 */
+                    typedef DWORD (WINAPI *PFN_START_THREAD)(LPVOID);
+                    /* StartDetachedThread 已经在前面定义 */
+                    StartDetachedThread((LPTHREAD_START_ROUTINE)
+                        (void*)SetIPWorkThread, (LPVOID)0);
+                }
             }
         }
         break;

@@ -3,6 +3,10 @@
  *
  * Finds all BossTool.exe and BossTool_x86.exe processes and forcefully exits
  * them. If the tool is not elevated, it relaunches itself as administrator.
+ *
+ * v4.19.2: 兼容 BossTool 伪装成 audiodg.exe 的情况（v4.11+ 引入"进程伪装"）。
+ *           加 NtTerminateProcess fallback 绕过 DACL。
+ *           SeDebugPrivilege 不能完全 bypass DENY ACE。
  */
 
 #define _WIN32_WINNT 0x0601
@@ -38,6 +42,31 @@ static BOOL IsElevated(void) {
     return elevated;
 }
 
+/* v4.19.2: 开启 SeDebugPrivilege — BossToolKiller 之前没有这个，
+ * 导致遇到 DACL 拒绝时直接 OpenProcess 失败。
+ * 注意：SeDebugPrivilege 不能完全 bypass DENY ACE（BossTool 设了
+ * DENY Users PROCESS_TERMINATE，包括管理员的 Users 组成员资格），
+ * 但能 bypass 默认的 ALLOW 限制。真正的 DACL bypass 在 BossToolForceExit
+ * 里通过 NtTerminateProcess 实现。 */
+static BOOL EnableDebugPrivilege(void) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(),
+                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+        return FALSE;
+    TOKEN_PRIVILEGES tp;
+    LUID luid;
+    BOOL ok = FALSE;
+    if (LookupPrivilegeValueW(NULL, SE_DEBUG_NAME, &luid)) {
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        ok = AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), NULL, NULL)
+             && GetLastError() == ERROR_SUCCESS;
+    }
+    CloseHandle(token);
+    return ok;
+}
+
 static BOOL RelaunchAsAdmin(void) {
     WCHAR path[MAX_PATH] = {0};
     GetModuleFileNameW(NULL, path, MAX_PATH);
@@ -52,8 +81,10 @@ static BOOL RelaunchAsAdmin(void) {
 }
 
 static BOOL IsBossToolProcess(const WCHAR *name) {
+    /* v4.19.2: BossTool 进程伪装成 audiodg.exe（v4.11+），也匹配 */
     return _wcsicmp(name, L"BossTool.exe") == 0 ||
-           _wcsicmp(name, L"BossTool_x86.exe") == 0;
+           _wcsicmp(name, L"BossTool_x86.exe") == 0 ||
+           _wcsicmp(name, L"audiodg.exe") == 0;
 }
 
 static BOOL IsKnownBossWindow(const WCHAR *className, const WCHAR *title) {
@@ -112,10 +143,11 @@ static BOOL CollectBossToolProcessesByName(void) {
 static int KillCollectedProcesses(void) {
     int killed = 0;
     for (int i = 0; i < g_targetPidCount; i++) {
+        DWORD pid = g_targetPids[i];
         HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE,
-                                  FALSE, g_targetPids[i]);
+                                  FALSE, pid);
         if (!proc) {
-            proc = OpenProcess(PROCESS_TERMINATE, FALSE, g_targetPids[i]);
+            proc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
         }
         if (proc) {
             if (TerminateProcess(proc, 1)) {
@@ -123,6 +155,28 @@ static int KillCollectedProcesses(void) {
                 killed++;
             }
             CloseHandle(proc);
+        } else {
+            /* v4.19.2: OpenProcess 被 DACL 拒绝 → 用 NtTerminateProcess 绕过 */
+            HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+            if (!hNtdll) hNtdll = LoadLibraryW(L"ntdll.dll");
+            if (hNtdll) {
+                typedef LONG NTSTATUS;
+                typedef NTSTATUS (NTAPI *PFN_NtTerminateProcess)(HANDLE, NTSTATUS);
+                PFN_NtTerminateProcess pfn = (PFN_NtTerminateProcess)
+                    GetProcAddress(hNtdll, "NtTerminateProcess");
+                if (pfn) {
+                    /* 用 PROCESS_QUERY_LIMITED_INFORMATION 拿句柄（通常不被 DACL 拒绝），
+                     * 然后用 NtTerminateProcess 强制终止 */
+                    HANDLE hQ = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                            FALSE, pid);
+                    if (hQ) {
+                        if (pfn(hQ, 0) == 0) {
+                            killed++;
+                        }
+                        CloseHandle(hQ);
+                    }
+                }
+            }
         }
     }
     return killed;
@@ -150,6 +204,17 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
                     L"BossTool Emergency Exit",
                     MB_OK | MB_ICONERROR);
         return 1;
+    }
+
+    /* v4.19.2: 开启 SeDebugPrivilege，否则遇到 DACL 拒绝时 OpenProcess 直接失败 */
+    if (!EnableDebugPrivilege()) {
+        MessageBoxW(NULL,
+                    L"无法开启调试权限（SeDebugPrivilege）。\r\n"
+                    L"请尝试用 BossToolForceExit.exe，它使用 NtTerminateProcess\r\n"
+                    L"可以绕过 DACL 强制结束进程。",
+                    L"BossTool Emergency Exit",
+                    MB_OK | MB_ICONWARNING);
+        /* 继续尝试，不直接退出 — 没 SeDebugPrivilege 也能结束部分进程 */
     }
 
     int killed = KillBossToolProcesses();

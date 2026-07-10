@@ -46,7 +46,9 @@ jobs:
         run: |
           gcc -O2 -municode -mwindows -o "${{ matrix.boss_exe }}" main.c -lws2_32 -liphlpapi -ladvapi32 -lshell32 -lcomctl32 -lshlwapi -lole32 -static
           gcc -O2 -municode -mwindows -o "${{ matrix.acl_exe }}" fix_acl_ultimate.c -ladvapi32 -lshell32 -static
-          gcc -O2 -municode -mwindows -o "${{ matrix.killer_exe }}" BossToolKiller.c -ladvapi32 -lshell32 -luser32 -static
+          gcc -O2 -municode -mwindows -o "${{ matrix.killer_exe }}" BossToolKiller.c -ladvapi32 -lshell32 -luser32 -lntdll -static
+          gcc -O2 -municode -mwindows -o "BossToolForceExit.exe" forcexit.c -ladvapi32 -lshell32 -luser32 -lkernel32 -lntdll -static
+          gcc -O2 -municode -mwindows -o "BossToolForceExit_x86.exe" forcexit.c -ladvapi32 -lshell32 -luser32 -lkernel32 -lntdll -static
 
       - name: Upload ${{ matrix.arch }} artifact
         uses: actions/upload-artifact@v4
