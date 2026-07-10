@@ -242,6 +242,24 @@ static volatile DWORD s_dwModAltTime  = 0;
 static volatile DWORD s_dwModWinTime  = 0;
 #define MOD_STALE_MS  5000  /* 5秒无对应UP事件视为状态卡死 */
 
+/* v4.19: 键盘钩子诊断日志开关
+ *
+ * 设置环境变量 BOSS_KEYHOOK_DEBUG=1 启用详细日志：
+ *   set BOSS_KEYHOOK_DEBUG=1
+ *   BossTool.exe
+ *
+ * 启用后会写以下事件到 %TEMP%\bosstool.log：
+ *   - 修饰键状态变化（Ctrl/Alt/Win DOWN/UP）
+ *   - 老板键触发瞬间（带时间戳）
+ *   - 状态超时自愈触发（带超时秒数）
+ *   - 吃 Win 键的瞬间（带原因）
+ *   - 钩子被 Windows 跳过（nCode < 0）次数
+ *
+ * 默认关闭以避免性能开销（WriteLog 涉及文件 I/O）。
+ * 如果再次出现 Win+L 闪烁问题，请启用此开关重现并把日志发给开发者。 */
+static volatile BOOL g_bHookDebug = FALSE;
+static volatile DWORD s_dwHookSkipCount = 0;  /* 钩子被跳过的累计次数 */
+
 /* v4.3: WriteLog 线程安全锁 — WatchdogThread/GuardThread/IPGuardThread/BossKeyThread
  * 都并发调用 WriteLog，无锁时多个线程同时 CreateFile/WriteFile 会导致
  * 文件句柄泄漏和缓冲区竞争，增加内核对象压力。 */
@@ -2513,7 +2531,16 @@ static void DoBossKey(void) {
    键盘钩子
    ============================================================ */
 LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode < 0) return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+    if (nCode < 0) {
+        /* v4.19: 钩子被 Windows 跳过计数（环境变量启用时记录） */
+        if (g_bHookDebug) {
+            DWORD cnt = (DWORD)InterlockedIncrement((LONG*)&s_dwHookSkipCount);
+            if ((cnt & 0x3F) == 1) {  /* 每 64 次写一次，避免日志爆炸 */
+                WriteLog(L"[HOOK] nCode<0 跳过累计 %lu 次", cnt);
+            }
+        }
+        return CallNextHookEx(g_hKeyHook, nCode, wParam, lParam);
+    }
 
     KBDLLHOOKSTRUCT *kb = (KBDLLHOOKSTRUCT*)lParam;
     UINT vk = kb->vkCode;
@@ -2528,21 +2555,30 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         DWORD dwNow = GetTickCount();
         if (s_bModCtrl && s_dwModCtrlTime != 0 &&
             (dwNow - s_dwModCtrlTime) > MOD_STALE_MS) {
+            DWORD stale = (dwNow - s_dwModCtrlTime) / 1000;
             s_bModCtrl = FALSE;
             s_dwModCtrlTime = 0;
             s_bBossComboTriggered = FALSE;
+            if (g_bHookDebug)
+                WriteLog(L"[HOOK] Ctrl 状态卡死自愈 (超时 %lu 秒)", stale);
         }
         if (s_bModAlt && s_dwModAltTime != 0 &&
             (dwNow - s_dwModAltTime) > MOD_STALE_MS) {
+            DWORD stale = (dwNow - s_dwModAltTime) / 1000;
             s_bModAlt = FALSE;
             s_dwModAltTime = 0;
             s_bBossComboTriggered = FALSE;
+            if (g_bHookDebug)
+                WriteLog(L"[HOOK] Alt 状态卡死自愈 (超时 %lu 秒)", stale);
         }
         if (s_bModWin && s_dwModWinTime != 0 &&
             (dwNow - s_dwModWinTime) > MOD_STALE_MS) {
+            DWORD stale = (dwNow - s_dwModWinTime) / 1000;
             s_bModWin = FALSE;
             s_dwModWinTime = 0;
             s_bBossComboTriggered = FALSE;
+            if (g_bHookDebug)
+                WriteLog(L"[HOOK] Win 状态卡死自愈 (超时 %lu 秒)", stale);
         }
     }
 
@@ -2556,14 +2592,24 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
         s_bModCtrl = bDown;
         if (bDown) s_dwModCtrlTime = GetTickCount();
         else { s_dwModCtrlTime = 0; s_bBossComboTriggered = FALSE; }
+        if (g_bHookDebug)
+            WriteLog(L"[HOOK] Ctrl %lc 0x%02X %s",
+                (vk == VK_LCONTROL ? L'L' : L'R'), vk, bDown ? L"DOWN" : L"UP");
     } else if (vk == VK_LMENU || vk == VK_RMENU) {
         s_bModAlt = bDown;
         if (bDown) s_dwModAltTime = GetTickCount();
         else { s_dwModAltTime = 0; s_bBossComboTriggered = FALSE; }
+        if (g_bHookDebug)
+            WriteLog(L"[HOOK] Alt %lc 0x%02X %s",
+                (vk == VK_LMENU ? L'L' : L'R'), vk, bDown ? L"DOWN" : L"UP");
     } else if (vk == VK_LWIN || vk == VK_RWIN) {
         s_bModWin = bDown;
         if (bDown) s_dwModWinTime = GetTickCount();
         else { s_dwModWinTime = 0; s_bBossComboTriggered = FALSE; }
+        if (g_bHookDebug)
+            WriteLog(L"[HOOK] Win %lc 0x%02X %s (Ctrl=%d Alt=%d)",
+                (vk == VK_LWIN ? L'L' : L'R'), vk, bDown ? L"DOWN" : L"UP",
+                (int)s_bModCtrl, (int)s_bModAlt);
     }
 
     /* v4.13: 删除锁屏功能， Win+L 不再拦截，正常传递给系统 */
@@ -2585,11 +2631,15 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
          * 卡住，5秒后也会被自动重置，Win+L 永远不会被误拦截。 */
         if ((vk == VK_LWIN || vk == VK_RWIN) && s_bModCtrl && s_bModAlt) {
             /* 三键全部按着，吃掉 Win 键防止开始菜单 */
+            if (g_bHookDebug)
+                WriteLog(L"[HOOK] 吃掉 Win 键（三键全按，触发老板键）");
             return 1;
         }
         /* 三键同时按下 → 触发老板键 */
         if (bDown && s_bModCtrl && s_bModWin && s_bModAlt && !s_bBossComboTriggered) {
             s_bBossComboTriggered = TRUE;
+            if (g_bHookDebug)
+                WriteLog(L"[HOOK] 老板键触发 vk=0x%02X", vk);
             DoBossKey();
             return 1;
         }
@@ -3132,6 +3182,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     g_hKeyHook=SetWindowsHookExW(WH_KEYBOARD_LL,
                                   KeyboardHookProc,
                                   hInstance,0);
+
+    /* v4.19: 检查 BOSS_KEYHOOK_DEBUG 环境变量启用诊断日志
+     * 见 g_bHookDebug 定义处的说明。 */
+    {
+        WCHAR szDebug[8] = {0};
+        if (GetEnvironmentVariableW(L"BOSS_KEYHOOK_DEBUG", szDebug, 7) > 0 &&
+            (szDebug[0] == L'1' || szDebug[0] == L'y' || szDebug[0] == L'Y' ||
+             _wcsicmp(szDebug, L"true") == 0)) {
+            InterlockedExchange((LONG*)&g_bHookDebug, TRUE);
+            WriteLog(L"v4.19: BOSS_KEYHOOK_DEBUG 已启用 — 详细日志写入 %%TEMP%%\\bosstool.log");
+        }
+    }
 
     /* 注册热键 */
     RegisterHotkeys(g_hWndMain);
