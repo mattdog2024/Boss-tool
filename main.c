@@ -1,5 +1,15 @@
 /*
- * BossTool v4.20 - Windows 7/8/10/11 隱形管理工具
+ * BossTool v4.21 - Windows 7/8/10/11 隱形管理工具
+ *
+ * v4.21 修复老板键记事本不响应问题：
+ *   - 根因：OpenNotepad/CloseNotepad 在 BeginNetworkChange 锁内部调用，
+ *     如果 IPGuardThread 正在恢复 IP 持有锁，BeginNetworkChange 失败
+ *     直接 return，记事本操作被完全跳过
+ *   - 修复 1：将 OpenNotepad/CloseNotepad 移到网络锁之外，确保始终执行
+ *   - 修复 2：CloseNotepad 改为先优雅关闭（WM_CLOSE），再强制终止
+ *   - 修复 3：OpenNotepad 增加等待残留进程退出逻辑（最多 2 秒），
+ *     避免 TerminateProcess 异步导致"误判为已运行"
+ *   - 修复 4：两个函数均增加日志输出，便于排查问题
  *
  * v4.20 修复 8.2.* 网络闪断（~1秒断连自动恢复）：
  *   - 根因：v4.4 将 MAC 随机化移至后台线程，但 MAC 线程 disable/enable
@@ -151,7 +161,7 @@
 #define DEFAULT_LOCK_PWD    L"6142234"
 #define DEFAULT_BOSS_MOD    (MOD_CONTROL|MOD_WIN|MOD_ALT)
 #define DEFAULT_BOSS_VK     'X'
-#define CONFIG_VERSION      17   /* v4.20: 修复 8.2.* 网络闪断（MAC/IP 竞态条件） */
+#define CONFIG_VERSION      18   /* v4.21: 修复老板键记事本不响应 */
 #define SETTINGS_MOD        (MOD_CONTROL|MOD_ALT)
 #define SETTINGS_VK         VK_F10
 
@@ -2167,48 +2177,152 @@ DWORD WINAPI IPGuardThread(LPVOID p) {
 
 /* ============================================================
    记事本控制
+   v4.21: 改进记事本打开/关闭逻辑
+   - 增加日志输出，便于排查问题
+   - CloseNotepad: 先尝试优雅关闭（WM_CLOSE），再强制终止（TerminateProcess）
+   - OpenNotepad: 等待被终止的残留进程退出（最多 2 秒），
+     避免"刚关闭又打开"时误判为已运行
    ============================================================ */
+
+/* v4.21: EnumWindows 回调 — 向属于指定 PID 的 notepad 窗口发送 WM_CLOSE */
+typedef struct { DWORD dwPid; BOOL bFound; } CLOSE_NOTEPAD_CTX;
+static BOOL CALLBACK CloseNotepadEnumWnd(HWND hwnd, LPARAM lParam) {
+    CLOSE_NOTEPAD_CTX *ctx = (CLOSE_NOTEPAD_CTX *)lParam;
+    DWORD wndPid = 0;
+    GetWindowThreadProcessId(hwnd, &wndPid);
+    if (wndPid == ctx->dwPid) {
+        WCHAR cls[64];
+        GetClassNameW(hwnd, cls, 64);
+        if (_wcsicmp(cls, L"Notepad") == 0) {
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            ctx->bFound = TRUE;
+        }
+    }
+    return TRUE;
+}
+
 static void OpenNotepad(void) {
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
+    /* 检查是否已在运行（含等待残留进程退出） */
+    for (int wait = 0; wait < 4; wait++) {
+        BOOL bFound = FALSE;
+        HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap == INVALID_HANDLE_VALUE) break;
         PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
         if (Process32FirstW(hSnap, &pe)) {
             do {
                 if (_wcsicmp(pe.szExeFile, L"notepad.exe") == 0) {
-                    CloseHandle(hSnap);
-                    return;
+                    bFound = TRUE;
+                    break;
                 }
             } while (Process32NextW(hSnap, &pe));
         }
         CloseHandle(hSnap);
+        if (!bFound) {
+            WriteLog(L"OpenNotepad: notepad 未运行，准备启动");
+            goto launch;
+        }
+        if (wait < 3) {
+            WriteLog(L"OpenNotepad: notepad 残留进程仍在退出，等待 500ms (%d/4)", wait + 1);
+            Sleep(500);
+        }
     }
-    WCHAR szNotepad[MAX_PATH];
-    GetSystemDirectoryW(szNotepad, MAX_PATH);
-    wcsncat(szNotepad, L"\\notepad.exe", MAX_PATH - wcslen(szNotepad) - 1);
-    STARTUPINFOW si; PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOW;
-    if (CreateProcessW(szNotepad, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    WriteLog(L"OpenNotepad: notepad 已在运行，跳过");
+    return;
+
+launch:
+    {
+        WCHAR szNotepad[MAX_PATH];
+        GetSystemDirectoryW(szNotepad, MAX_PATH);
+        wcsncat(szNotepad, L"\\notepad.exe", MAX_PATH - wcslen(szNotepad) - 1);
+        STARTUPINFOW si; PROCESS_INFORMATION pi;
+        ZeroMemory(&si, sizeof(si)); ZeroMemory(&pi, sizeof(pi));
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_SHOW;
+        if (CreateProcessW(szNotepad, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            WriteLog(L"OpenNotepad: 已启动 notepad.exe (PID %lu)", pi.dwProcessId);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            WriteLog(L"OpenNotepad: CreateProcessW 失败，错误码 %lu", GetLastError());
+        }
     }
 }
 
+/* v4.21: 改进关闭逻辑
+ * 1. 先尝试优雅关闭（向 notepad 窗口发 WM_CLOSE）
+ * 2. 等待最多 2 秒
+ * 3. 如仍未退出，强制 TerminateProcess */
 static void CloseNotepad(void) {
+    /* 第一步：收集所有 notepad PID 并尝试优雅关闭 */
+    DWORD pids[16]; int nPids = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return;
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        WriteLog(L"CloseNotepad: CreateToolhelp32Snapshot 失败，错误码 %lu", GetLastError());
+        return;
+    }
     PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            if (_wcsicmp(pe.szExeFile, L"notepad.exe") == 0) {
-                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe.th32ProcessID);
-                if (hProc) { TerminateProcess(hProc, 0); CloseHandle(hProc); }
+            if (_wcsicmp(pe.szExeFile, L"notepad.exe") == 0 && nPids < 16) {
+                pids[nPids++] = pe.th32ProcessID;
+                CLOSE_NOTEPAD_CTX ctx = { pe.th32ProcessID, FALSE };
+                EnumWindows(CloseNotepadEnumWnd, (LPARAM)&ctx);
+                if (ctx.bFound)
+                    WriteLog(L"CloseNotepad: 已向 PID %lu 发送 WM_CLOSE", pe.th32ProcessID);
+                else
+                    WriteLog(L"CloseNotepad: PID %lu 无可见窗口，将强制终止", pe.th32ProcessID);
             }
         } while (Process32NextW(hSnap, &pe));
     }
     CloseHandle(hSnap);
+
+    if (nPids == 0) {
+        WriteLog(L"CloseNotepad: notepad 未运行，无需关闭");
+        return;
+    }
+
+    /* 第二步：等待进程退出（最多 2 秒） */
+    for (int i = 0; i < 4; i++) {
+        Sleep(500);
+        BOOL anyAlive = FALSE;
+        HANDLE hSnap2 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnap2 == INVALID_HANDLE_VALUE) break;
+        PROCESSENTRY32W pe2; pe2.dwSize = sizeof(pe2);
+        if (Process32FirstW(hSnap2, &pe2)) {
+            do {
+                if (_wcsicmp(pe2.szExeFile, L"notepad.exe") == 0) {
+                    for (int j = 0; j < nPids; j++) {
+                        if (pe2.th32ProcessID == pids[j]) { anyAlive = TRUE; break; }
+                    }
+                }
+            } while (Process32NextW(hSnap2, &pe2));
+        }
+        CloseHandle(hSnap2);
+        if (!anyAlive) {
+            WriteLog(L"CloseNotepad: 所有 notepad 进程已优雅退出");
+            return;
+        }
+    }
+
+    /* 第三步：强制终止仍然存活的进程 */
+    WriteLog(L"CloseNotepad: WM_CLOSE 超时，强制终止残留 notepad 进程");
+    HANDLE hSnap3 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap3 == INVALID_HANDLE_VALUE) return;
+    PROCESSENTRY32W pe3; pe3.dwSize = sizeof(pe3);
+    if (Process32FirstW(hSnap3, &pe3)) {
+        do {
+            if (_wcsicmp(pe3.szExeFile, L"notepad.exe") == 0) {
+                HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pe3.th32ProcessID);
+                if (hProc) {
+                    TerminateProcess(hProc, 0);
+                    CloseHandle(hProc);
+                    WriteLog(L"CloseNotepad: 已强制终止 PID %lu", pe3.th32ProcessID);
+                }
+            }
+        } while (Process32NextW(hSnap3, &pe3));
+    }
+    CloseHandle(hSnap3);
 }
 
 /* v4.4: RandomizeMac 的线程包装函数 */
@@ -2229,29 +2343,36 @@ static void SetIPWork(void) {
      * 改回同步后，老板键切换增加 ~3-5秒（MAC 冷却期内跳过则无延迟），
      * 但彻底消除竞态条件，不再有网络闪断。
      *
-     * 执行顺序：MAC → BeginNetworkChange → ClearIP → ApplyIP → EndNetworkChange
+     * v4.21: 将 CloseNotepad 移至网络锁之外，避免 BeginNetworkChange
+     * 失败时记事本关闭被跳过（"按老板键记事本不响应"的根因）。
+     *
+     * 执行顺序：MAC → CloseNotepad → BeginNetworkChange → ClearIP → ApplyIP → EndNetworkChange
      * MAC 完成后网卡已稳定，ApplyIP 一定能成功。 */
     if (g_bEnableMacRandomization)
         RandomizeMac();  /* v4.20: 同步执行，确保网卡稳定后再应用 IP */
+    CloseNotepad();  /* v4.21: 移到锁外，确保始终执行 */
     if (!BeginNetworkChange()) return;
     ClearAccumulatedIPs();
     wcsncpy(g_szExpectedIP, IP_WORK1, 63);
     ApplyIP(IP_WORK1, IP_WORK_MASK, IP_WORK_GW, IP_WORK_DNS, IP_WORK2, IP_WORK_MASK);
     LockIPReg();
-    CloseNotepad();
     EndNetworkChange();
 }
 
 static void SetIPBoss(void) {
-    /* v4.20: 同 SetIPWork，MAC 随机化同步执行 */
+    /* v4.20: 同 SetIPWork，MAC 随机化同步执行
+     * v4.21: 将 OpenNotepad 移至网络锁之外，避免 BeginNetworkChange
+     * 失败时记事本打开被跳过（"按老板键记事本不响应"的根因）。
+     *
+     * 执行顺序：MAC → OpenNotepad → BeginNetworkChange → ClearIP → ApplyIP → EndNetworkChange */
     if (g_bEnableMacRandomization)
         RandomizeMac();  /* v4.20: 同步执行，确保网卡稳定后再应用 IP */
+    OpenNotepad();  /* v4.21: 移到锁外，确保始终执行 */
     if (!BeginNetworkChange()) return;
     ClearAccumulatedIPs();
     wcsncpy(g_szExpectedIP, IP_BOSS, 63);
     ApplyIP(IP_BOSS, IP_BOSS_MASK, IP_BOSS_GW, NULL, NULL, NULL);
     LockIPReg();
-    OpenNotepad();
     EndNetworkChange();
 }
 
