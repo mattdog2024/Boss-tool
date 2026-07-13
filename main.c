@@ -2748,7 +2748,49 @@ static DWORD WINAPI SetIPWorkThread(LPVOID p) {
     return 0;
 }
 
+/* v4.22: 释放所有按着的修饰键(用 SendInput 模拟 KEYUP)
+ *
+ * 背景:老板键默认 Ctrl+Win+Alt+X。当 X 按下触发 DoBossKey 时,
+ *      用户的 Ctrl/Alt/Win 通常仍处于按下状态。
+ *      之前 v4.16-v4.21 的钩子逻辑会"吃掉 Win 键"防开始菜单弹出,
+ *      但条件只判断 vk==VK_LWIN && s_bModCtrl && s_bModAlt,
+ *      对 DOWN 和 UP 都生效,导致 Win UP 事件被吃 → Windows
+ *      内核永远认为 Win 键按下,触发 Win+L / Win+Tab / Win+D 等
+ *      组合键误触发(屏幕疯狂切换、字符无法输入到应用窗口)。
+ *
+ * 修复:老板键触发时,主动用 SendInput 给系统补发一组修饰键 KEYUP,
+ *      把 Ctrl / Alt / Shift / Win 全部声明为已释放,Windows 内核
+ *      状态被强制同步。本函数幂等,即使某些键并未按着,补发 KEYUP
+ *      也是无副作用(等于"重新声明已释放")。 */
+static void ReleaseAllModifiers(void) {
+    static const WORD keys[] = {
+        VK_LCONTROL, VK_RCONTROL,
+        VK_LMENU,    VK_RMENU,
+        VK_LSHIFT,   VK_RSHIFT,
+        VK_LWIN,     VK_RWIN
+    };
+    INPUT inputs[8] = {0};
+    UINT n = 0;
+    for (size_t i = 0; i < sizeof(keys)/sizeof(keys[0]); i++) {
+        inputs[n].type           = INPUT_KEYBOARD;
+        inputs[n].ki.wVk         = keys[i];
+        inputs[n].ki.wScan       = 0;
+        inputs[n].ki.dwFlags     = KEYEVENTF_KEYUP;
+        inputs[n].ki.time        = 0;
+        inputs[n].ki.dwExtraInfo = 0;
+        n++;
+    }
+    if (n > 0) {
+        SendInput(n, inputs, sizeof(INPUT));
+        if (g_bHookDebug)
+            WriteLog(L"[HOOK] 老板键触发:已 SendInput 释放 %u 个修饰键", n);
+    }
+}
+
 static void DoBossKey(void) {
+    /* v4.22: 先主动释放所有修饰键,把系统内核的修饰键状态同步为"已释放",
+     *        避免 Win 键卡死导致屏幕切换/字符无法输入等问题。 */
+    ReleaseAllModifiers();
     if (!g_bBossMode) {
         InterlockedExchange((LONG*)&g_bBossMode, TRUE);
         StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)TRUE);
@@ -2860,10 +2902,17 @@ LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
          *
          * v4.19: 同时配合上面的超时自愈，即使 s_bModCtrl/s_bModAlt 真的
          * 卡住，5秒后也会被自动重置，Win+L 永远不会被误拦截。 */
-        if ((vk == VK_LWIN || vk == VK_RWIN) && s_bModCtrl && s_bModAlt) {
-            /* 三键全部按着，吃掉 Win 键防止开始菜单 */
+        /* v4.22: 关键修复 — 只在 Win DOWN 时吃事件(防开始菜单弹出),
+         *        Win UP 必须放行让系统收到,否则 Windows 内核会认为
+         *        Win 键一直按着,触发 Win+L/Win+Tab/Win+D 等组合键
+         *        误触发(屏幕疯狂切换、字符无法输入到应用窗口)。
+         *
+         * 配合 v4.22 DoBossKey 内 ReleaseAllModifiers() 在老板键触发时
+         * 主动 SendInput 补发所有修饰键 KEYUP,双重保障系统状态一致。 */
+        if (bDown && (vk == VK_LWIN || vk == VK_RWIN) && s_bModCtrl && s_bModAlt) {
+            /* 三键全部按着,吃 Win DOWN 防开始菜单 */
             if (g_bHookDebug)
-                WriteLog(L"[HOOK] 吃掉 Win 键（三键全按，触发老板键）");
+                WriteLog(L"[HOOK] 吃掉 Win 键 DOWN（三键全按，触发老板键）");
             return 1;
         }
         /* 三键同时按下 → 触发老板键 */
