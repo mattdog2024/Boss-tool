@@ -10,6 +10,8 @@
  *   - 修复 3：OpenNotepad 增加等待残留进程退出逻辑（最多 2 秒），
  *     避免 TerminateProcess 异步导致"误判为已运行"
  *   - 修复 4：两个函数均增加日志输出，便于排查问题
+ *   - 修复 5：IsAdapterOperational 改用 GetIfEntry 获取 dwOperStatus，
+ *     原 IP_ADAPTER_INFO.OperStatus 在 MinGW 头文件中不存在导致编译失败
  *
  * v4.20 修复 8.2.* 网络闪断（~1秒断连自动恢复）：
  *   - 根因：v4.4 将 MAC 随机化移至后台线程，但 MAC 线程 disable/enable
@@ -2049,7 +2051,9 @@ static void UnlockIPReg(void) {
 
 /* v4.20: 检查适配器操作状态是否为 UP（IF_OPER_STATUS_OPERATIONAL）
  * 用于 IPGuardThread 在重新应用 IP 前确认适配器已完全恢复。
- * 避免在适配器还在初始化时就执行 netsh/PowerShell 导致闪断。 */
+ * 避免在适配器还在初始化时就执行 netsh/PowerShell 导致闪断。
+ * v4.21: 改用 GetIfEntry 代替 IP_ADAPTER_INFO.OperStatus，
+ *        后者在 MinGW 头文件中不存在，导致编译失败。 */
 static BOOL IsAdapterOperational(void) {
     ULONG bufLen = 16384;
     PIP_ADAPTER_INFO pInfo = (PIP_ADAPTER_INFO)malloc(bufLen);
@@ -2059,12 +2063,15 @@ static BOOL IsAdapterOperational(void) {
         for (PIP_ADAPTER_INFO p = pInfo; p; p = p->Next) {
             if (p->Type == MIB_IF_TYPE_ETHERNET ||
                 p->Type == IF_TYPE_IEEE80211) {
-                /* OperStatus (RFC 2863 ifOperStatus):
-                 *   1 = up/operational (connected)
-                 *   2 = down/disconnected
-                 *   3 = testing, 4 = unknown, 5 = dormant
-                 * 只在 1(operational) 时才认为适配器就绪 */
-                operational = (p->OperStatus == 1);
+                /* 用 GetIfEntry 获取 dwOperStatus（MinGW 兼容） */
+                MIB_IFROW ifRow;
+                ZeroMemory(&ifRow, sizeof(ifRow));
+                ifRow.dwIndex = p->Index;
+                if (GetIfEntry(&ifRow) == NO_ERROR) {
+                    /* dwOperStatus: 1=operational, 2=unreachable,
+                     * 3=testing, 4=unknown, 5= dormant */
+                    operational = (ifRow.dwOperStatus == 1);
+                }
                 break;
             }
         }
