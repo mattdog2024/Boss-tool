@@ -97,13 +97,18 @@ jobs:
         with:
           name: BossTool ${{ github.ref_name }}
           body: |
-            Fixes long-running network resets that could lead to ERR_NO_BUFFER_SPACE.
+            BossTool v4.23 focuses on state consistency and safe failure handling.
 
             Changes:
-            - Check whether the target IP exists on the adapter instead of comparing only the first returned IP.
-            - Add a network-change lock so multiple threads do not change the adapter at the same time.
-            - Close thread handles after creating background threads to reduce long-running resource use.
-            - Add BossToolKiller.exe for emergency exit. Run it as administrator to force close old BossTool processes before starting the new version.
+            - Serialize boss-mode transitions and verify the target IP before committing mode state.
+            - Restore and verify the work IP before allowing the process to exit.
+            - Keep vault state when eject fails and prevent BitLocker credentials from appearing in logs.
+            - Store vault passwords only for the current process session.
+            - Manage only the Notepad instance started by BossTool and preserve unsaved documents.
+            - Stop deleting unrelated browser, Explorer, Recent, RDP history, and system policies.
+            - Treat child-process timeouts as failures instead of successful completion.
+
+            Compatibility note: the vault password must be entered again after each program restart.
           files: |
             BossTool.exe
             BossTool_x86.exe

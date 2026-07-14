@@ -240,6 +240,7 @@ static HANDLE    g_hMutex       = NULL;
 
 /* 状态标志 */
 static volatile BOOL g_bBossMode = FALSE;
+static volatile LONG g_lBossSwitchBusy = 0;
 /* v4.15: g_bLocked 已删除 */
 static volatile LONG g_lNetworkChangeBusy = 0;
 static volatile LONG g_lEmergencyFixBusy  = 0;
@@ -326,6 +327,8 @@ static WCHAR g_szVaultPwd[128]          = L"";   /* BitLocker 密码（内存中
 static WCHAR g_szVaultDrive[4]          = L"";   /* 当前挂载的盘符，如 L"E:" */
 static WCHAR g_szVaultSymlink[MAX_PATH] = L"";   /* 临时符号链接路径（.vhdx 扩展名） */
 static volatile BOOL g_bVaultMounted    = FALSE; /* 是否已挂载 */
+static HANDLE g_hManagedNotepad = NULL;
+static DWORD  g_dwManagedNotepadPid = 0;
 
 /* v4.15: 锁屏状态变量已删除 */
 
@@ -370,10 +373,11 @@ static void WriteLog(const WCHAR *fmt, ...);
 static DWORD RunNetshDirect(const WCHAR *args);
 static const WCHAR* GetAdapterName(void);
 static void RandomizeMac(void);
-static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
+static DWORD ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs);
 static BOOL BeginNetworkChange(void);
 static void EndNetworkChange(void);
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param);
+static void EscapePowerShellSingleQuoted(const WCHAR *src, WCHAR *dst, size_t dstCount);
 static void EmergencyNetworkFix(void);
 static void ClearAccumulatedIPs(void);
 static BOOL IsAdapterOperational(void);  /* v4.20: 检查适配器是否完全 up */
@@ -414,11 +418,14 @@ static DWORD ExecHiddenEx(const WCHAR *cmd) {
     }
     _snwprintf(buf, 4095, L"\"%ls\" /c %ls", szComSpec, cmd);
     buf[4095] = 0;
-    DWORD exitCode = 0;
+    DWORD exitCode = ERROR_PROCESS_ABORTED;
     if (CreateProcessW(NULL, buf, NULL, NULL, FALSE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 30000);
-        GetExitCodeProcess(pi.hProcess, &exitCode);
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 30000);
+        if (waitResult == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+        else
+            exitCode = (waitResult == WAIT_TIMEOUT) ? WAIT_TIMEOUT : GetLastError();
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
@@ -454,7 +461,7 @@ static void ExecAsync(const WCHAR *cmd) {
 }
 
 /* 直接调用 PowerShell.exe */
-static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
+static DWORD ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
     WCHAR szPS[MAX_PATH] = {0};
     GetSystemDirectoryW(szPS, MAX_PATH);
     wcsncat(szPS, L"\\WindowsPowerShell\\v1.0\\powershell.exe",
@@ -477,20 +484,27 @@ static void ExecPowerShell(const WCHAR *psScript, BOOL bWait, DWORD timeoutMs) {
     si.cb = sizeof(si);
     si.dwFlags = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
-    WriteLog(L"ExecPowerShell: %ls", cmdLine);
+    /* Scripts may contain credentials, so only log execution results. */
     if (!CreateProcessW(szPS, cmdLine, NULL, NULL, FALSE,
                         CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WriteLog(L"ExecPowerShell: CreateProcess FAILED err=%lu", GetLastError());
-        return;
+        return GetLastError();
     }
     if (bWait) {
-        WaitForSingleObject(pi.hProcess, timeoutMs);
-        DWORD exitCode = 0;
-        GetExitCodeProcess(pi.hProcess, &exitCode);
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, timeoutMs);
+        DWORD exitCode = ERROR_PROCESS_ABORTED;
+        if (waitResult == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+        else
+            exitCode = (waitResult == WAIT_TIMEOUT) ? WAIT_TIMEOUT : GetLastError();
         WriteLog(L"ExecPowerShell: exit=%lu", exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        return exitCode;
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    return ERROR_SUCCESS;
 }
 
 static BOOL BeginNetworkChange(void) {
@@ -509,6 +523,16 @@ static void EndNetworkChange(void) {
 static void StartDetachedThread(LPTHREAD_START_ROUTINE proc, LPVOID param) {
     HANDLE hThread = CreateThread(NULL, 0, proc, param, 0, NULL);
     if (hThread) CloseHandle(hThread);
+}
+
+static void EscapePowerShellSingleQuoted(const WCHAR *src, WCHAR *dst, size_t dstCount) {
+    size_t out = 0;
+    if (!dstCount) return;
+    while (*src && out + 1 < dstCount) {
+        if (*src == L'\'' && out + 2 < dstCount) dst[out++] = L'\'';
+        dst[out++] = *src++;
+    }
+    dst[out] = 0;
 }
 
 /* ============================================================
@@ -915,15 +939,19 @@ static BOOL VaultMount(HWND hWndParent) {
      *   $pw = ConvertTo-SecureString '密码' -AsPlainText -Force
      *   Unlock-BitLocker -MountPoint 'X:' -Password $pw
      */
-    WCHAR szUnlockPS[1024];
-    _snwprintf(szUnlockPS, 1023,
+    WCHAR escapedPwd[256];
+    WCHAR szUnlockPS[1280];
+    EscapePowerShellSingleQuoted(g_szVaultPwd, escapedPwd, 256);
+    _snwprintf(szUnlockPS, 1279,
         L"$p = ConvertTo-SecureString '%ls' -AsPlainText -Force; "
         L"Unlock-BitLocker -MountPoint '%lc:' -Password $p",
-        g_szVaultPwd, cDrive);
-    szUnlockPS[1023] = 0;
+        escapedPwd, cDrive);
+    szUnlockPS[1279] = 0;
 
     WriteLog(L"VaultMount: 步骤6 执行 BitLocker 解锁");
-    ExecPowerShell(szUnlockPS, TRUE, 15000);
+    DWORD unlockResult = ExecPowerShell(szUnlockPS, TRUE, 15000);
+    SecureZeroMemory(escapedPwd, sizeof(escapedPwd));
+    SecureZeroMemory(szUnlockPS, sizeof(szUnlockPS));
 
     /* 等待解锁完成 */
     Sleep(2000);
@@ -932,7 +960,7 @@ static BOOL VaultMount(HWND hWndParent) {
     WCHAR szTest[8];
     _snwprintf(szTest, 7, L"%lc:\\", cDrive);
     DWORD attrs = GetFileAttributesW(szTest);
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
+    if (unlockResult != ERROR_SUCCESS || attrs == INVALID_FILE_ATTRIBUTES) {
         WriteLog(L"VaultMount: 解锁后盘符 %lc: 无法访问，可能密码错误", cDrive);
         if (hWndParent) {
             WCHAR msg[256];
@@ -1012,7 +1040,7 @@ static BOOL VaultEject(HWND hWndParent) {
     szDismountPS[MAX_PATH + 255] = 0;
 
     WriteLog(L"VaultEject: 执行 PowerShell Dismount-DiskImage [%ls]", pImagePath);
-    ExecPowerShell(szDismountPS, TRUE, 15000);
+    DWORD dismountResult = ExecPowerShell(szDismountPS, TRUE, 15000);
 
     /* 备用：如果 PowerShell 弹出失败，用 diskpart */
     Sleep(1000);
@@ -1043,6 +1071,7 @@ static BOOL VaultEject(HWND hWndParent) {
             _snwprintf(szCmd, MAX_PATH + 63, L"diskpart /s \"%ls\"", szScript);
             szCmd[MAX_PATH + 63] = 0;
             DWORD exitCode = ExecHiddenEx(szCmd);
+            if (exitCode == ERROR_SUCCESS) dismountResult = ERROR_SUCCESS;
             WriteLog(L"VaultEject: diskpart 备用退出码=%lu", exitCode);
             DeleteFileW(szScript);
         }
@@ -1050,6 +1079,15 @@ static BOOL VaultEject(HWND hWndParent) {
 
     /* 步骤3: 等待盘符消失 */
     Sleep(2000);
+
+    dwAfter = GetAllDrives();
+    if (g_szVaultDrive[0] && (dwAfter & (1u << (g_szVaultDrive[0] - L'A')))) {
+        WriteLog(L"VaultEject: drive remains mounted (result=%lu)", dismountResult);
+        if (hWndParent)
+            MessageBoxW(hWndParent, L"保险箱弹出失败，磁盘仍处于挂载状态。请关闭占用文件后重试。",
+                        L"弹出失败", MB_OK | MB_ICONERROR);
+        return FALSE;
+    }
 
     /* 步骤3b: 删除符号链接（AppHider CleanupSymlink） */
     CleanupVaultSymlink();
@@ -1316,16 +1354,8 @@ static void SaveVaultConfig(void) {
                 (LPBYTE)g_szVaultPath,
                 (DWORD)((wcslen(g_szVaultPath)+1)*sizeof(WCHAR)));
 
-            /* 保存密码（XOR 混淆） */
-            int pwdLen = (int)wcslen(g_szVaultPwd);
-            BYTE pwdBuf[256];
-            for (int i = 0; i <= pwdLen; i++) {
-                WCHAR c = g_szVaultPwd[i];
-                pwdBuf[i*2]   = (BYTE)(c & 0xFF) ^ VAULT_XOR_KEY;
-                pwdBuf[i*2+1] = (BYTE)((c >> 8) & 0xFF) ^ VAULT_XOR_KEY;
-            }
-            RegSetValueExW(hKey, L"VK", 0, REG_BINARY,
-                pwdBuf, (DWORD)((pwdLen+1)*2));
+            /* Passwords are session-only. Remove legacy reversible storage. */
+            RegDeleteValueW(hKey, L"VK");
 
             RegCloseKey(hKey);
             break;
@@ -1345,20 +1375,8 @@ static void LoadVaultConfig(void) {
             RegQueryValueExW(hKey, L"VP", NULL, &dwType,
                              (LPBYTE)g_szVaultPath, &dwSize);
 
-            /* 加载密码（XOR 解混淆） */
-            BYTE pwdBuf[256] = {0};
-            dwSize = sizeof(pwdBuf);
-            if (RegQueryValueExW(hKey, L"VK", NULL, &dwType,
-                                 pwdBuf, &dwSize) == ERROR_SUCCESS) {
-                int chars = (int)(dwSize / 2);
-                if (chars > 127) chars = 127;
-                for (int i = 0; i < chars; i++) {
-                    WCHAR c = (WCHAR)((pwdBuf[i*2] ^ VAULT_XOR_KEY) |
-                              ((pwdBuf[i*2+1] ^ VAULT_XOR_KEY) << 8));
-                    g_szVaultPwd[i] = c;
-                }
-                g_szVaultPwd[chars] = 0;
-            }
+            /* Never restore the legacy reversibly-obfuscated password. */
+            g_szVaultPwd[0] = 0;
 
             RegCloseKey(hKey);
             break;
@@ -1883,8 +1901,11 @@ static DWORD RunNetshDirect(const WCHAR *args) {
     DWORD exitCode = 1;
     if (CreateProcessW(szNetsh, cmdLine, NULL, NULL, FALSE,
                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        WaitForSingleObject(pi.hProcess, 15000);
-        GetExitCodeProcess(pi.hProcess, &exitCode);
+        DWORD waitResult = WaitForSingleObject(pi.hProcess, 15000);
+        if (waitResult == WAIT_OBJECT_0)
+            GetExitCodeProcess(pi.hProcess, &exitCode);
+        else
+            exitCode = (waitResult == WAIT_TIMEOUT) ? WAIT_TIMEOUT : GetLastError();
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
@@ -2209,6 +2230,13 @@ static BOOL CALLBACK CloseNotepadEnumWnd(HWND hwnd, LPARAM lParam) {
 }
 
 static void OpenNotepad(void) {
+    if (g_hManagedNotepad) {
+        if (WaitForSingleObject(g_hManagedNotepad, 0) == WAIT_TIMEOUT) return;
+        CloseHandle(g_hManagedNotepad);
+        g_hManagedNotepad = NULL;
+        g_dwManagedNotepadPid = 0;
+    }
+#if 0
     /* 检查是否已在运行（含等待残留进程退出） */
     for (int wait = 0; wait < 4; wait++) {
         BOOL bFound = FALSE;
@@ -2237,6 +2265,7 @@ static void OpenNotepad(void) {
     return;
 
 launch:
+#endif
     {
         WCHAR szNotepad[MAX_PATH];
         GetSystemDirectoryW(szNotepad, MAX_PATH);
@@ -2248,7 +2277,8 @@ launch:
         si.wShowWindow = SW_SHOW;
         if (CreateProcessW(szNotepad, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
             WriteLog(L"OpenNotepad: 已启动 notepad.exe (PID %lu)", pi.dwProcessId);
-            CloseHandle(pi.hProcess);
+            g_hManagedNotepad = pi.hProcess;
+            g_dwManagedNotepadPid = pi.dwProcessId;
             CloseHandle(pi.hThread);
         } else {
             WriteLog(L"OpenNotepad: CreateProcessW 失败，错误码 %lu", GetLastError());
@@ -2261,6 +2291,18 @@ launch:
  * 2. 等待最多 2 秒
  * 3. 如仍未退出，强制 TerminateProcess */
 static void CloseNotepad(void) {
+    if (!g_hManagedNotepad) return;
+    CLOSE_NOTEPAD_CTX managed = { g_dwManagedNotepadPid, FALSE };
+    EnumWindows(CloseNotepadEnumWnd, (LPARAM)&managed);
+    if (WaitForSingleObject(g_hManagedNotepad, 2000) == WAIT_TIMEOUT)
+        WriteLog(L"CloseNotepad: managed Notepad still open; preserving unsaved user data");
+    else {
+        CloseHandle(g_hManagedNotepad);
+        g_hManagedNotepad = NULL;
+        g_dwManagedNotepadPid = 0;
+    }
+    return;
+#if 0
     /* 第一步：收集所有 notepad PID 并尝试优雅关闭 */
     DWORD pids[16]; int nPids = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -2330,6 +2372,7 @@ static void CloseNotepad(void) {
         } while (Process32NextW(hSnap3, &pe3));
     }
     CloseHandle(hSnap3);
+#endif
 }
 
 /* v4.4: RandomizeMac 的线程包装函数 */
@@ -2387,6 +2430,11 @@ static void SetIPBoss(void) {
    清理痕迹
    ============================================================ */
 static void CleanTraces(void) {
+    /* Broad history deletion was intentionally removed: it destroyed unrelated
+       browser, Explorer, Recent and RDP history. The tool creates no scoped
+       history entries that can be safely identified here. */
+    return;
+#if 0
     WCHAR cmd[1024];
     WCHAR szPath[MAX_PATH];
     HKEY hKey;
@@ -2495,6 +2543,7 @@ static void CleanTraces(void) {
     }
 
     (void)cmd;
+#endif
 }
 
 /* ============================================================
@@ -2619,12 +2668,15 @@ static void RegisterHotkeys(HWND hWnd) {
    ============================================================ */
 DWORD WINAPI BossKeyThread(LPVOID pParam) {
     BOOL bEnterBoss = (BOOL)(ULONG_PTR)pParam;
+    BOOL bSwitchSucceeded = FALSE;
     if (bEnterBoss) {
         /* 进入老板模式：隐藏程序立即执行（用户感知快），切换IP和挂载保险筱在后台进行 */
         HideProcessWindows();   /* v4.17: 先隐藏，用户感知即刻响应 */
         CleanTraces();
         SetIPBoss();            /* IP切换在隐藏后执行 */
         VaultAutoMount();
+        bSwitchSucceeded = AdapterHasIP(IP_BOSS);
+        if (!bSwitchSucceeded) ShowProcessWindows();
     } else {
         /* v4.17: 退出老板模式优化：
          * 1. 先显示窗口（用户感知即刻响应）
@@ -2633,7 +2685,7 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
         ShowProcessWindows();   /* v4.17: 先显示，用户感知快 */
         CleanTraces();
         /* VaultAutoEject 在独立线程里执行，不阻塞 IP 切换 */
-        StartDetachedThread(VaultEjectThread, NULL);
+        VaultAutoEject();
         /* IP 切换并验证 */
         SetIPWork();
         /* v4.17: 验证网络是否恢复，最多重试 3 次 */
@@ -2660,7 +2712,14 @@ DWORD WINAPI BossKeyThread(LPVOID pParam) {
                 }
             }
         }
+        bSwitchSucceeded = AdapterHasIP(IP_WORK1);
+        if (!bSwitchSucceeded) HideProcessWindows();
     }
+    if (bSwitchSucceeded)
+        InterlockedExchange((LONG*)&g_bBossMode, bEnterBoss);
+    else
+        WriteLog(L"Boss mode switch failed; preserving previous mode state");
+    InterlockedExchange(&g_lBossSwitchBusy, 0);
     return 0;
 }
 /* v4.17: VaultAutoEject 独立线程，不阻塞 IP 切换 */
@@ -2691,6 +2750,9 @@ static DWORD WINAPI VaultEjectThread(LPVOID p) {
  * 这种情况下 reg.exe 也会失败（这是 Windows 安全设计，不是 bug）。
  * 这种情况用户需要联系 IT 部门解除策略。 */
 static void CleanupLockWorkstationPolicy(void) {
+    /* Never delete machine or domain policies that this process did not set. */
+    return;
+#if 0
     HKEY hKey;
     BOOL bAnyDeleted = FALSE;
     LPCWSTR rgValuesToDelete[] = {
@@ -2725,6 +2787,7 @@ static void CleanupLockWorkstationPolicy(void) {
     if (!bAnyDeleted) {
         WriteLog(L"v4.19: 注册表项无需清理（不存在或权限不足）");
     }
+#endif
 }
 
 DWORD WINAPI InitialIPThread(LPVOID pParam) {
@@ -2791,13 +2854,12 @@ static void DoBossKey(void) {
     /* v4.22: 先主动释放所有修饰键,把系统内核的修饰键状态同步为"已释放",
      *        避免 Win 键卡死导致屏幕切换/字符无法输入等问题。 */
     ReleaseAllModifiers();
-    if (!g_bBossMode) {
-        InterlockedExchange((LONG*)&g_bBossMode, TRUE);
-        StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)TRUE);
-    } else {
-        InterlockedExchange((LONG*)&g_bBossMode, FALSE);
-        StartDetachedThread(BossKeyThread, (LPVOID)(ULONG_PTR)FALSE);
-    }
+    if (InterlockedCompareExchange(&g_lBossSwitchBusy, 1, 0) != 0) return;
+    BOOL targetBossMode = !g_bBossMode;
+    HANDLE hThread = CreateThread(NULL, 0, BossKeyThread,
+                                  (LPVOID)(ULONG_PTR)targetBossMode, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+    else InterlockedExchange(&g_lBossSwitchBusy, 0);
 }
 
 /* ============================================================
@@ -3282,19 +3344,30 @@ LRESULT CALLBACK SettingsWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPar
                 L"确定要退出 BossTool 吗？\r\n如果当前处于老板模式，退出前会自动恢复工作IP。",
                 L"退出确认", MB_YESNO | MB_ICONQUESTION);
             if (ret == IDYES) {
+                if (g_lBossSwitchBusy) {
+                    MessageBoxW(hWnd, L"模式正在切换，请等待完成后再退出。",
+                                L"暂时无法退出", MB_OK | MB_ICONINFORMATION);
+                    break;
+                }
                 /* 关闭设置窗口 */
                 ShowWindow(hWnd, SW_HIDE);
-                /* 退出主程序（不阻塞） */
-                DestroyWindow(g_hWndMain);
                 /* v4.19.2: 如果在老板模式，异步恢复工作IP（不等它完成） */
                 if (g_bBossMode) {
+                    HANDLE hRestore = CreateThread(NULL, 0, SetIPWorkThread, NULL, 0, NULL);
+                    DWORD waitResult = hRestore ? WaitForSingleObject(hRestore, 120000) : WAIT_FAILED;
+                    if (hRestore) CloseHandle(hRestore);
+                    if (waitResult != WAIT_OBJECT_0 || !AdapterHasIP(IP_WORK1)) {
+                        ShowWindow(hWnd, SW_SHOW);
+                        MessageBoxW(hWnd, L"工作网络尚未恢复，已取消退出。请检查网卡后重试。",
+                                    L"无法退出", MB_OK | MB_ICONERROR);
+                        break;
+                    }
                     InterlockedExchange((LONG*)&g_bBossMode, FALSE);
                     /* 用 detached thread 异步恢复网络，避免阻塞进程退出 */
-                    typedef DWORD (WINAPI *PFN_START_THREAD)(LPVOID);
                     /* StartDetachedThread 已经在前面定义 */
-                    StartDetachedThread((LPTHREAD_START_ROUTINE)
-                        (void*)SetIPWorkThread, (LPVOID)0);
+                    /* Network restoration completed before process shutdown. */
                 }
+                DestroyWindow(g_hWndMain);
             }
         }
         break;
@@ -3506,6 +3579,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInst,
     if(g_bVaultMounted) VaultEject(NULL);
 
     if(g_hKeyHook) UnhookWindowsHookEx(g_hKeyHook);
+    if (g_hManagedNotepad) CloseHandle(g_hManagedNotepad);
+    SecureZeroMemory(g_szVaultPwd, sizeof(g_szVaultPwd));
     UnregisterHotKey(g_hWndMain,HOTKEY_BOSS);
     UnregisterHotKey(g_hWndMain,HOTKEY_SETTINGS);
     UnregisterHotKey(g_hWndMain,HOTKEY_NETFIX);
